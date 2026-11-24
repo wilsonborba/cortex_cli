@@ -24,7 +24,14 @@ pub struct CortexClient {
 
 impl CortexClient {
     pub fn new(session: Arc<Session>) -> Result<Self, ChatFailure> {
-        Self::with_base("https://api.asodya.com/apps/cortex/v1", session)
+        Self::with_base(
+            &format!(
+                "{}{}",
+                crate::core::settings::GATEWAY_URL,
+                crate::core::settings::CORTEX_API_PATH
+            ),
+            session,
+        )
     }
 
     fn with_base(base: &str, session: Arc<Session>) -> Result<Self, ChatFailure> {

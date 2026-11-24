@@ -108,3 +108,11 @@ fn mapped_flags_reject_extra_or_private_arguments_without_echo() {
         assert!(parse(args(&invalid)).is_err());
     }
 }
+
+#[test]
+fn narrow_activity_wrap_preserves_thai_and_complete_detail_text() {
+    let text = "Reading example.txt 3/10 สวัสดีภาษาไทย";
+    let rows = cortex_cli::presentation::cli::terminal::wrapped(text, 20);
+    assert!(rows.iter().all(|row| row.width() <= 20));
+    assert_eq!(rows.join(""), text);
+}
