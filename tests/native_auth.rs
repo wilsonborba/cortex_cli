@@ -188,6 +188,20 @@ fn local_expiry_makes_no_finish_request() {
 }
 
 #[test]
+fn invalid_success_credentials_end_handoff_without_persistence() {
+    let gateway = FakeGateway::default();
+    let mut invalid = finished();
+    invalid.session.csrf_token.clear();
+    gateway.responses.borrow_mut().push_back(Ok(invalid));
+    let mut service = AuthService::new(gateway, FakeStore::default());
+    service.start().unwrap();
+    assert!(matches!(service.finish(), Err(AuthFailure::Invalid)));
+    assert!(service.pending.is_none());
+    assert!(service.session.is_none());
+    assert!(service.store.read().unwrap().is_none());
+}
+
+#[test]
 fn cancellation_and_eof_each_send_one_cancel_and_no_finish() {
     for input in ["cancel\n", ""] {
         let mut service = AuthService::new(FakeGateway::default(), FakeStore::default());

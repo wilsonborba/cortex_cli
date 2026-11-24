@@ -49,7 +49,10 @@ impl<G: Gateway, S: SessionStore> AuthService<G, S> {
         }
         let result = match self.gateway.finish(pending) {
             Ok(value) if value.session.is_valid() => value,
-            Ok(_) => return Err(AuthFailure::Invalid),
+            Ok(_) => {
+                self.pending = None;
+                return Err(AuthFailure::Invalid);
+            }
             Err(error) => {
                 if !matches!(
                     error,
