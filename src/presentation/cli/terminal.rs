@@ -83,6 +83,29 @@ pub fn clipped(text: &str, cells: usize) -> String {
     out
 }
 
+pub fn wrapped(text: &str, cells: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    for character in clean(text).replace('\t', "    ").chars() {
+        if character == '\n' {
+            rows.push(std::mem::take(&mut row));
+            continue;
+        }
+        let mut next = row.clone();
+        next.push(character);
+        if next.width() > cells && !row.is_empty() {
+            rows.push(row);
+            row = character.to_string();
+        } else {
+            row = next;
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 pub fn editor_view(editor: &Editor, columns: usize) -> (String, u16) {
     let budget = columns.saturating_sub(4);
     let before = editor.text[..editor.cursor]
@@ -151,16 +174,16 @@ pub fn activity_lines(
         );
     }
     lines.push(format!(
-        "Ctrl+O {} details{}",
+        "Ctrl+O {} |{}",
         if expanded { "collapse" } else { "expand" },
         if elapsed.is_some() {
             if state.output_id.is_some() {
-                "  Ctrl+C stop"
+                " Ctrl+C stop"
             } else {
-                "  Ctrl+C disconnect"
+                " Ctrl+C disconnect"
             }
         } else {
-            "  Ctrl+D exit"
+            " Ctrl+D exit"
         }
     ));
     lines
@@ -229,6 +252,22 @@ impl Surface {
     ) -> io::Result<()> {
         self.clear(out)?;
         let mut lines = activity_lines(state, expanded, elapsed, self.height);
+        if expanded && lines.len() > 2 {
+            let mut details = lines[1..lines.len() - 1]
+                .iter()
+                .flat_map(|line| wrapped(line.strip_prefix("  ").unwrap_or(line), self.columns - 3))
+                .map(|line| format!("  {line}"))
+                .collect::<Vec<_>>();
+            let maximum = self.height.saturating_sub(5).min(12);
+            if details.len() > maximum {
+                details.drain(..details.len() - maximum);
+            }
+            let footer = lines.pop().unwrap();
+            let heading = lines.remove(0);
+            lines = vec![heading];
+            lines.extend(details);
+            lines.push(footer);
+        }
         let input = editor.map(|e| editor_view(e, self.columns));
         if let Some((line, _)) = &input {
             lines.push(line.clone());
