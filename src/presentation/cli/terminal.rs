@@ -315,7 +315,7 @@ pub fn logo(out: &mut impl Write, colour: bool) -> io::Result<()> {
         " ▄██▀\r\n       ▀●▀\r\n      ▄█ █▄\r\n     ██   ██\r\n\r\n"
     )?;
     if colour {
-        queue!(out, SetForegroundColor(Color::Cyan))?;
+        queue!(out, SetForegroundColor(Color::Reset))?;
     }
     write!(out, "Cortex\r\n")?;
     if colour {
