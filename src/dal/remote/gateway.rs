@@ -213,6 +213,8 @@ mod tests {
             assert_eq!(text.len(), 43);
             assert_eq!(URL_SAFE_NO_PAD.decode(text).unwrap().len(), 32);
         }
+        assert_eq!(value["handoff_id"], URL_SAFE_NO_PAD.encode([42; 32]));
+        assert_eq!(value["secret"], URL_SAFE_NO_PAD.encode([24; 32]));
         assert_eq!(value.get("cancel"), cancelled.then_some(&Value::Bool(true)));
     }
 
