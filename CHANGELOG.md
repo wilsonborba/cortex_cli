@@ -6,6 +6,7 @@
 - Document owner Mac verification without hosted CI
 - Clarify public macOS build instructions
 - Merge bootstrap review corrections
+- Update terminal chat changelog
 
 
 ### Features
@@ -13,6 +14,8 @@
 - Merge native Asodya sign-in
 - Add Cortex chat streaming and inline activity view
 - Use accepted output identity for cancellation and reconnect
+- Merge inline terminal chat
+- Add explicit Annotations note selection
 
 
 ### Fixes
