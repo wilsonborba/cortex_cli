@@ -82,7 +82,10 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
         return Err(failure("No Cortex conversation is available to continue."));
     }
     if let Some(prompt) = options.prompt {
-        let mut state = ChatState::default();
+        let mut state = ChatState {
+            chat_id: chat.clone(),
+            ..Default::default()
+        };
         let mut text = TerminalText::default();
         let stream = api.send(chat.as_deref(), &prompt).map_err(failure)?;
         consume(stream, |event| {
@@ -241,7 +244,10 @@ fn interactive<G: ChatApi + 'static>(
                         }
                         let text = editor.take();
                         surface.text(out, &format!("\n> {}\n", clean(&text)))?;
-                        state = ChatState::default();
+                        state = ChatState {
+                            chat_id: chat.clone(),
+                            ..Default::default()
+                        };
                         cleaner = TerminalText::default();
                         started = Some(Instant::now());
                         let (tx, rx) = mpsc::channel();

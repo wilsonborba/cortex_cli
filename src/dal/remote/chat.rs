@@ -158,7 +158,7 @@ impl ChatApi for CortexClient {
         let value = self.get(&format!("/chats/{id}?limit=20"))?;
         let page: ChatPage = serde_json::from_value(value["data"].clone())
             .map_err(|_| ChatFailure::InvalidResponse)?;
-        if page.chat.session_id != id {
+        if !page.chat.session_id.eq_ignore_ascii_case(id) {
             return Err(ChatFailure::InvalidResponse);
         }
         Ok(page)

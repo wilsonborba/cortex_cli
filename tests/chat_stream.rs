@@ -134,3 +134,18 @@ fn done_and_error_are_the_only_terminal_events() {
         Err(ChatFailure::Rejected(Some(1201)))
     );
 }
+
+#[test]
+fn continuation_cannot_silently_switch_to_another_chat() {
+    let mut state = ChatState {
+        chat_id: Some(CHAT.into()),
+        ..Default::default()
+    };
+    let event=StreamEvent::from_payload(Some(1),"done".into(),json!({"message":"Output complete","data":{"session_id":OUTPUT,"output_id":OUTPUT,"total_ms":1}}).to_string().as_bytes()).unwrap();
+    assert!(matches!(
+        state.apply(&event),
+        Err(ChatFailure::InvalidResponse)
+    ));
+    assert_eq!(state.chat_id.as_deref(), Some(CHAT));
+    assert!(!state.complete);
+}

@@ -138,6 +138,13 @@ impl ChatState {
                     .as_str()
                     .filter(|id| valid_id(id))
                     .ok_or(ChatFailure::InvalidResponse)?;
+                if self
+                    .chat_id
+                    .as_ref()
+                    .is_some_and(|expected| !expected.eq_ignore_ascii_case(chat))
+                {
+                    return Err(ChatFailure::InvalidResponse);
+                }
                 self.chat_id = Some(chat.into());
                 self.output_id = Some(output.into());
                 self.total_ms = Some(

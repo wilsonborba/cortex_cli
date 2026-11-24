@@ -69,7 +69,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
                 if !crate::domain::models::chat::valid_id(id) {
                     return Err(ParseError);
                 }
-                options.conversation = Some(id.clone());
+                options.conversation = Some(id.to_ascii_lowercase());
             }
             _ => return Err(ParseError),
         }
