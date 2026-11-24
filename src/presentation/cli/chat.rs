@@ -399,6 +399,12 @@ fn begin_turn<G: ChatApi + 'static>(
 }
 
 impl RemoteCommandQueue {
+    fn enqueue(&mut self, event: RemoteEvent, acknowledged_cursor: u64) {
+        if event.id > acknowledged_cursor && self.seen.insert(event.id) {
+            self.pending.push_back(event);
+        }
+    }
+
     fn poll(
         &mut self,
         remote: &RemoteSessionGuard,
@@ -408,9 +414,7 @@ impl RemoteCommandQueue {
         surface: &mut Surface,
     ) -> io::Result<()> {
         while let Ok(event) = remote.receiver.try_recv() {
-            if event.id > remote.cursor.load(Ordering::Relaxed) && self.seen.insert(event.id) {
-                self.pending.push_back(event);
-            }
+            self.enqueue(event, remote.cursor.load(Ordering::Relaxed));
         }
         if Instant::now() < self.retry_at {
             return Ok(());
@@ -877,6 +881,28 @@ mod tests {
         std::sync::Mutex::new(Vec::new());
     static CANCELLATIONS: std::sync::Mutex<Vec<(String, String)>> =
         std::sync::Mutex::new(Vec::new());
+
+    #[test]
+    fn command_queue_deduplicates_replayed_prompts_across_acknowledged_cursor() {
+        let make_prompt = |id| RemoteEvent {
+            id,
+            kind: RemoteEventKind::Prompt,
+            payload: json!({"prompt":"hello", "file_ids":[]}),
+            created_at_ms: id,
+        };
+        let mut queue = RemoteCommandQueue::default();
+        queue.enqueue(make_prompt(1), 0);
+        queue.enqueue(make_prompt(1), 0);
+        assert_eq!(queue.pending.len(), 1);
+
+        let accepted = queue.pending.pop_front().unwrap();
+        queue.seen.remove(&accepted.id);
+        queue.enqueue(make_prompt(1), 1);
+        queue.enqueue(make_prompt(2), 1);
+        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(queue.pending.front().unwrap().id, 2);
+    }
+
     struct Fixture;
     struct SlowFrames {
         frames: VecDeque<Vec<u8>>,
