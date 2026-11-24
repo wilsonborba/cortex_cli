@@ -26,10 +26,8 @@ cargo test --locked --all-targets
 cargo build --locked --release
 ```
 
-Run the same commands on the owner Mac with its native Rust toolchain. Apple
+Run the same commands on macOS with its native Rust toolchain. Apple
 silicon uses `aarch64-apple-darwin`; Intel Macs use `x86_64-apple-darwin`.
-The manager checks the macOS build on the owner Mac during review.
-
 On macOS with Rust 1.91.1 installed:
 
 ```sh
@@ -41,8 +39,8 @@ rustup run 1.91.1 cargo build --locked --release
 ./target/release/cortex --version
 ```
 
-Run these commands on each native Mac architecture being verified. A Linux build
-does not verify macOS linking or runtime behavior.
+Use a native Apple silicon or Intel Mac for its architecture. A Linux build does
+not verify macOS linking or runtime behavior.
 
 ## Structure
 
