@@ -49,7 +49,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
                 if options.prompt.is_some() {
                     return Err(ParseError);
                 }
-                options.prompt = Some(args.next().ok_or(ParseError)?.clone());
+                let prompt = args.next().ok_or(ParseError)?;
+                if prompt.trim().is_empty() {
+                    return Err(ParseError);
+                }
+                options.prompt = Some(prompt.clone());
             }
             "--continue" | "-c" => {
                 if options.continue_latest || options.conversation.is_some() {
