@@ -1,0 +1,246 @@
+//! Owner-scoped Annotations reads through the authenticated gateway.
+
+use crate::domain::models::{
+    annotations::{NoteSection, NotesApi, SelectedNote},
+    chat::{ChatFailure, valid_id},
+    native_auth::Session,
+};
+use reqwest::{
+    blocking::{Client, Response},
+    redirect::Policy,
+};
+use serde_json::Value;
+use std::{io::Read, sync::Arc, time::Duration};
+
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Clone)]
+pub struct AnnotationsClient {
+    client: Client,
+    base: String,
+    session: Arc<Session>,
+}
+
+impl AnnotationsClient {
+    pub fn new(session: Arc<Session>) -> Result<Self, ChatFailure> {
+        Self::with_base(
+            &format!(
+                "{}{}",
+                crate::core::settings::GATEWAY_URL,
+                "/apps/annotations/v1"
+            ),
+            session,
+        )
+    }
+
+    fn with_base(base: &str, session: Arc<Session>) -> Result<Self, ChatFailure> {
+        if !session.is_valid() {
+            return Err(ChatFailure::Unauthorized);
+        }
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|_| ChatFailure::Connection)?;
+        Ok(Self {
+            client,
+            base: base.trim_end_matches('/').to_owned(),
+            session,
+        })
+    }
+
+    fn json(response: Response) -> Result<Value, ChatFailure> {
+        if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
+            return Err(ChatFailure::Unauthorized);
+        }
+        if !response.status().is_success() {
+            return Err(ChatFailure::Rejected(None));
+        }
+        let mut body = Vec::new();
+        response
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| ChatFailure::Connection)?;
+        if body.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        serde_json::from_slice(&body).map_err(|_| ChatFailure::InvalidResponse)
+    }
+
+    fn read_note(&self, note_id: &str) -> Result<SelectedNote, ChatFailure> {
+        if !valid_id(note_id) {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let response = self
+            .client
+            .get(format!("{}/me/notes/{note_id}?view=typed", self.base))
+            .header(
+                "Cookie",
+                format!(
+                    "sid={}; csrf={}",
+                    self.session.session_id, self.session.csrf_token
+                ),
+            )
+            .header("Accept", "application/json")
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let value = Self::json(response)?;
+        let returned_id = value["note_id"]
+            .as_str()
+            .filter(|id| valid_id(id) && id.eq_ignore_ascii_case(note_id))
+            .ok_or(ChatFailure::InvalidResponse)?;
+        let revision = value["revision"]
+            .as_u64()
+            .filter(|revision| *revision > 0)
+            .ok_or(ChatFailure::InvalidResponse)?;
+        let typed = value["representations"]
+            .as_array()
+            .ok_or(ChatFailure::InvalidResponse)?
+            .iter()
+            .filter(|representation| representation["representation"] == "typed")
+            .collect::<Vec<_>>();
+        if typed.len() != 1 {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        let revision_id = typed[0]["revision_id"]
+            .as_str()
+            .filter(|id| valid_id(id))
+            .ok_or(ChatFailure::InvalidResponse)?;
+        let document = &typed[0]["document"];
+        let blocks = document["blocks"]
+            .as_array()
+            .ok_or(ChatFailure::InvalidResponse)?;
+        let mut sections = Vec::new();
+        for block in blocks {
+            let id = block["id"]
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 128)
+                .ok_or(ChatFailure::InvalidResponse)?;
+            let mut pieces = Vec::new();
+            collect_text(block, &mut pieces);
+            let text = pieces.join("");
+            if !text.is_empty() {
+                sections.push(NoteSection {
+                    id: id.to_owned(),
+                    text,
+                });
+            }
+        }
+        let title = value["title"].as_str().map(str::to_owned);
+        Ok(SelectedNote {
+            note_id: returned_id.to_owned(),
+            revision,
+            revision_id: revision_id.to_owned(),
+            title,
+            sections,
+        })
+    }
+}
+
+fn collect_text(value: &Value, output: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => items.iter().for_each(|item| collect_text(item, output)),
+        Value::Object(object) => {
+            if let Some(text) = object.get("text").and_then(Value::as_str) {
+                output.push(text.to_owned());
+            }
+            for (key, child) in object {
+                if key != "text" {
+                    collect_text(child, output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+impl NotesApi for AnnotationsClient {
+    fn selected_note(&self, note_id: &str) -> Result<SelectedNote, ChatFailure> {
+        self.read_note(note_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::Write, net::TcpListener, thread};
+
+    const NOTE: &str = "10000000-0000-4000-8000-000000000001";
+
+    fn fixture(body: String, status: u16) -> (AnnotationsClient, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 65536);
+            }
+            write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let client = AnnotationsClient::with_base(
+            &format!("http://{address}/apps/annotations/v1"),
+            Arc::new(Session {
+                session_id: "fixture-session".into(),
+                csrf_token: "fixture-csrf".into(),
+            }),
+        )
+        .unwrap();
+        (client, worker)
+    }
+
+    #[test]
+    fn selected_note_uses_owner_route_typed_view_and_gateway_session() {
+        let body = serde_json::json!({
+            "note_id": NOTE,
+            "revision": 4,
+            "title": "Cells",
+            "representations": [{
+                "representation": "typed",
+                "revision_id": "20000000-0000-4000-8000-000000000002",
+                "document": {"blocks": [{"id": "b1", "kind": "paragraph", "spans": [{"text": "Cell wall"}]}]}
+            }],
+            "publication": null
+        }).to_string();
+        let (client, worker) = fixture(body, 200);
+        let note = client.selected_note(NOTE).unwrap();
+        let request = worker.join().unwrap();
+        assert!(request.starts_with(&format!(
+            "GET /apps/annotations/v1/me/notes/{NOTE}?view=typed HTTP/1.1"
+        )));
+        let lower = request.to_lowercase();
+        assert!(lower.contains("cookie: sid=fixture-session; csrf=fixture-csrf"));
+        assert!(lower.contains("accept: application/json"));
+        assert!(!lower.contains("x-uuid:"));
+        assert_eq!(note.revision, 4);
+        assert_eq!(note.sections[0].id, "b1");
+        assert_eq!(note.sections[0].text, "Cell wall");
+    }
+
+    #[test]
+    fn selected_note_rejects_wrong_owner_identity_and_wrong_shape() {
+        let body =
+            serde_json::json!({"note_id": "20000000-0000-4000-8000-000000000002"}).to_string();
+        let (client, worker) = fixture(body, 200);
+        assert!(matches!(
+            client.selected_note(NOTE),
+            Err(ChatFailure::InvalidResponse)
+        ));
+        worker.join().unwrap();
+
+        let (client, worker) = fixture("{}".into(), 404);
+        assert!(matches!(
+            client.selected_note(NOTE),
+            Err(ChatFailure::Rejected(None))
+        ));
+        worker.join().unwrap();
+    }
+}

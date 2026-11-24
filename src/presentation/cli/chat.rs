@@ -12,7 +12,10 @@ use crate::{
     },
     dal::{
         local::session::OsSessionStore,
-        remote::{chat::CortexClient, gateway::GatewayClient, login_context},
+        remote::{
+            annotations::AnnotationsClient, chat::CortexClient, gateway::GatewayClient,
+            login_context,
+        },
     },
     domain::{
         models::{
@@ -20,6 +23,7 @@ use crate::{
             native_auth::{AuthFailure, Session},
         },
         services::{
+            annotations::{selected_context, with_selected_context},
             auth::AuthService,
             chat::{ChatApi, ChatState, follow, latest_chat, owned_history, running_output},
         },
@@ -64,10 +68,28 @@ fn session() -> io::Result<Arc<Session>> {
 }
 
 pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
+    execute_with_note_gate(options, out, settings::ANNOTATIONS_SOURCE_ENABLED)
+}
+
+fn execute_with_note_gate(
+    options: ChatOptions,
+    out: &mut impl Write,
+    notes_enabled: bool,
+) -> io::Result<()> {
     if options.prompt.is_none() && (!io::stdin().is_terminal() || !io::stdout().is_terminal()) {
         return out.write_all(super::formatters::help().as_bytes());
     }
-    let api = Arc::new(CortexClient::new(session()?).map_err(failure)?);
+    if !options.note_ids.is_empty() && !notes_enabled {
+        return Err(failure(ChatFailure::SourceUnavailable));
+    }
+    let auth = session()?;
+    let context = if options.note_ids.is_empty() {
+        String::new()
+    } else {
+        let notes = AnnotationsClient::new(auth.clone()).map_err(failure)?;
+        selected_context(&notes, &options.note_ids).map_err(failure)?
+    };
+    let api = Arc::new(CortexClient::new(auth).map_err(failure)?);
     let chat = if options.continue_latest {
         latest_chat(api.as_ref()).map_err(failure)?
     } else {
@@ -97,7 +119,8 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
             ..Default::default()
         };
         let mut text = TerminalText::default();
-        let stream = api.send(chat.as_deref(), &prompt).map_err(failure)?;
+        let request = with_selected_context(&prompt, &context);
+        let stream = api.send(chat.as_deref(), &request).map_err(failure)?;
         follow(api.as_ref(), stream, &mut state, |event| {
             if event.name == "token" {
                 out.write_all(
@@ -112,13 +135,14 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
         .map_err(failure)?;
         return writeln!(out);
     }
-    interactive(api, chat, history, out)
+    interactive(api, chat, history, &context, out)
 }
 
 fn interactive<G: ChatApi + 'static>(
     api: Arc<G>,
     mut chat: Option<String>,
     history: Option<ChatPage>,
+    context: &str,
     out: &mut impl Write,
 ) -> io::Result<()> {
     let _raw = RawTerminal::enter(out)?;
@@ -299,12 +323,14 @@ fn interactive<G: ChatApi + 'static>(
                         receiver = Some(rx);
                         let api = api.clone();
                         let id = chat.clone();
+                        let context = context.to_owned();
                         thread::spawn(move || {
                             let mut state = ChatState {
                                 chat_id: id.clone(),
                                 ..Default::default()
                             };
-                            let result = api.send(id.as_deref(), &text).and_then(|stream| {
+                            let request = with_selected_context(&text, &context);
+                            let result = api.send(id.as_deref(), &request).and_then(|stream| {
                                 follow(api.as_ref(), stream, &mut state, |event| {
                                     tx.send(Ok(event)).map_err(|_| ChatFailure::Connection)
                                 })
@@ -428,7 +454,7 @@ mod tests {
         assert!(io::stdin().is_terminal());
         let mut out = io::stdout().lock();
         write!(out, "\x1b[2J\x1b[H").unwrap();
-        interactive(Arc::new(Fixture), None, None, &mut out).unwrap();
+        interactive(Arc::new(Fixture), None, None, "", &mut out).unwrap();
         assert_eq!(*DETAIL_STATES.lock().unwrap(), vec![true, false]);
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     }
@@ -437,7 +463,7 @@ mod tests {
     fn terminal_cancel_fixture() {
         assert!(io::stdin().is_terminal());
         let mut out = io::stdout().lock();
-        interactive(Arc::new(Fixture), None, None, &mut out).unwrap();
+        interactive(Arc::new(Fixture), None, None, "", &mut out).unwrap();
         assert_eq!(
             *CANCELLATIONS.lock().unwrap(),
             vec![(
@@ -446,5 +472,20 @@ mod tests {
             )]
         );
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
+    }
+
+    #[test]
+    fn unreleased_notes_gate_fails_before_login_or_network_access() {
+        let options = ChatOptions {
+            prompt: Some("Explain this".into()),
+            note_ids: vec!["10000000-0000-4000-8000-000000000001".into()],
+            ..Default::default()
+        };
+        let error = execute_with_note_gate(options, &mut Vec::new(), false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unavailable until its gateway route is ready")
+        );
     }
 }
