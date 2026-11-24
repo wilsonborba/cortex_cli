@@ -12,6 +12,7 @@ use crate::domain::{
         chat::{ChatFailure, ChatPage, ChatSummary, valid_id},
         native_auth::Session,
         remote_control::{RemoteEvent, RemoteEventKind, RemoteSession},
+        tools::{MAX_TOOL_RESULT_BYTES, ToolResult},
     },
     services::chat::ChatApi,
 };
@@ -221,16 +222,13 @@ impl CortexClient {
     }
 }
 
-impl ChatApi for CortexClient {
-    fn send(&self, chat: Option<&str>, text: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
-        self.send_with_files(chat, text, &[])
-    }
-
-    fn send_with_files(
+impl CortexClient {
+    fn send_request(
         &self,
         chat: Option<&str>,
         text: &str,
         file_ids: &[String],
+        tools: bool,
     ) -> Result<Box<dyn Read + Send>, ChatFailure> {
         if text.trim().is_empty() {
             return Err(ChatFailure::InvalidInput);
@@ -252,6 +250,11 @@ impl ChatApi for CortexClient {
             .post(format!("{}{path}", self.base))
             .json(&body)
             .header("Accept", "text/event-stream");
+        let request = if tools {
+            request.header("x-cortex-tools", "mapped-v1")
+        } else {
+            request
+        };
         let response = self
             .authenticated(request, true)
             .send()
@@ -270,6 +273,67 @@ impl ChatApi for CortexClient {
             return Err(ChatFailure::InvalidResponse);
         }
         Ok(Box::new(response))
+    }
+}
+
+impl ChatApi for CortexClient {
+    fn send(&self, chat: Option<&str>, text: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        self.send_with_files(chat, text, &[])
+    }
+
+    fn send_with_files(
+        &self,
+        chat: Option<&str>,
+        text: &str,
+        file_ids: &[String],
+    ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        self.send_request(chat, text, file_ids, false)
+    }
+
+    fn send_tools_with_files(
+        &self,
+        chat: Option<&str>,
+        text: &str,
+        file_ids: &[String],
+    ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        self.send_request(chat, text, file_ids, true)
+    }
+
+    fn submit_tool_result(
+        &self,
+        chat: &str,
+        output: &str,
+        result: &ToolResult,
+    ) -> Result<(), ChatFailure> {
+        if !valid_id(chat)
+            || !valid_id(output)
+            || !valid_id(&result.call_id)
+            || result.output.len() > MAX_TOOL_RESULT_BYTES
+        {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let response = self
+            .authenticated(
+                self.client
+                    .post(format!(
+                        "{}/chats/{chat}/outputs/{output}/tool-results",
+                        self.base
+                    ))
+                    .timeout(Duration::from_secs(20))
+                    .json(&json!({
+                        "call_id": result.call_id,
+                        "name": result.name.as_str(),
+                        "result": {"output": result.output}
+                    })),
+                true,
+            )
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let value = Self::json(Self::checked(response)?)?;
+        if value["data"]["accepted"] != true || value["data"]["call_id"] != result.call_id {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        Ok(())
     }
 
     fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
@@ -411,6 +475,57 @@ mod tests {
             assert!(value.get("session_id").is_none());
             assert!(value.get("user_id").is_none());
         }
+    }
+
+    #[test]
+    fn opted_in_chat_keeps_dtos_unchanged_and_selects_mapped_tools() {
+        let (client, worker) = server(200, "text/event-stream", String::new());
+        drop(client.send_tools_with_files(None, "inspect", &[]).unwrap());
+        let request = worker.join().unwrap();
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("POST /apps/cortex/v1/chats HTTP/1.1"));
+        assert!(head.to_lowercase().contains("x-cortex-tools: mapped-v1"));
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            body,
+            json!({"app_id":"cortex","text":"inspect","stream":true})
+        );
+    }
+
+    #[test]
+    fn tool_result_uses_the_exact_output_route_and_matching_call_envelope() {
+        let call_id = "30000000-0000-4000-8000-000000000003";
+        let response =
+            json!({"message":"Tool result accepted","data":{"accepted":true,"call_id":call_id}})
+                .to_string();
+        let (client, worker) = server(202, "application/json", response);
+        client
+            .submit_tool_result(
+                CHAT,
+                OUTPUT,
+                &ToolResult {
+                    call_id: call_id.into(),
+                    name: crate::domain::models::tools::ToolName::ViewFile,
+                    output: "1: example".into(),
+                },
+            )
+            .unwrap();
+        let request = worker.join().unwrap();
+        assert!(request.starts_with(&format!(
+            "POST /apps/cortex/v1/chats/{CHAT}/outputs/{OUTPUT}/tool-results HTTP/1.1"
+        )));
+        let lower = request.to_lowercase();
+        assert!(lower.contains("x-csrf-token: fixture-csrf"));
+        assert!(lower.contains("cookie: sid=fixture-session; csrf=fixture-csrf"));
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "call_id":call_id,
+                "name":"view_file",
+                "result":{"output":"1: example"}
+            })
+        );
     }
 
     #[test]

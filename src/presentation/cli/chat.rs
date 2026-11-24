@@ -19,11 +19,13 @@ use crate::{
             chat::{ChatFailure, ChatPage, StreamEvent},
             native_auth::{AuthFailure, Session},
             remote_control::{RemoteEvent, RemoteEventKind},
+            tools::{ToolName, ToolResult},
         },
         services::{
             auth::AuthService,
             chat::{ChatApi, ChatState, follow, latest_chat, owned_history, running_output},
             remote_control::reconnect_delay,
+            tools::execute_readonly,
         },
     },
 };
@@ -361,7 +363,7 @@ fn spawn_turn<G: ChatApi + 'static>(
         };
         let mut answer = String::new();
         let result = api
-            .send_with_files(chat_id.as_deref(), &prompt, &file_ids)
+            .send_tools_with_files(chat_id.as_deref(), &prompt, &file_ids)
             .and_then(|stream| {
                 follow(api.as_ref(), stream, &mut state, |event| {
                     if event.name == "token" && publisher.is_some() {
@@ -414,6 +416,44 @@ fn begin_turn<G: ChatApi + 'static>(
     let (sender, receiver) = mpsc::channel();
     spawn_turn(api, chat_id, prompt, file_ids, publisher, sender);
     receiver
+}
+
+fn submit_tool_call(api: &impl ChatApi, state: &mut ChatState) -> Result<(), ChatFailure> {
+    let request = state
+        .tool_request
+        .take()
+        .ok_or(ChatFailure::InvalidResponse)?;
+    let (chat, output) = match (state.chat_id.as_deref(), state.output_id.as_deref()) {
+        (Some(chat), Some(output)) => (chat, output),
+        _ => return Err(ChatFailure::InvalidResponse),
+    };
+    let output_text = match execute_readonly(&request) {
+        Ok(Some(output)) => output,
+        Ok(None) => match request.name {
+            ToolName::InvokeSubagent => {
+                "Not executed: a real child runner is not available for this request.".into()
+            }
+            ToolName::ReplaceFileContent | ToolName::RunCommand => {
+                "Not executed: this action has no verified shared approval binding.".into()
+            }
+            ToolName::ViewFile | ToolName::GrepSearch => {
+                return Err(ChatFailure::InvalidResponse);
+            }
+        },
+        Err(error) => error.to_string(),
+    };
+    if output_text.len() > crate::domain::models::tools::MAX_TOOL_RESULT_BYTES {
+        return Err(ChatFailure::InvalidResponse);
+    }
+    api.submit_tool_result(
+        chat,
+        output,
+        &ToolResult {
+            call_id: request.call_id,
+            name: request.name,
+            output: output_text,
+        },
+    )
 }
 
 impl RemoteCommandQueue {
@@ -745,6 +785,14 @@ fn interactive<G: ChatApi + 'static>(
                                     out,
                                     &cleaner.push(event.data["text"].as_str().unwrap_or("")),
                                 )?;
+                            }
+                            if event.name == "tool_call" {
+                                if let Err(error) = submit_tool_call(api.as_ref(), &mut state) {
+                                    surface.text(out, &format!("\n{error}\n"))?;
+                                    finished = true;
+                                    break;
+                                }
+                                surface.text(out, "\nTool result returned to Cortex.\n")?;
                             }
                             if state.complete {
                                 chat = state.chat_id.clone();

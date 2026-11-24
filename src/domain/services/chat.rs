@@ -2,7 +2,10 @@
 
 use crate::{
     dal::remote::sse::SseDecoder,
-    domain::models::chat::{ChatFailure, ChatPage, ChatSummary, StreamEvent, valid_id},
+    domain::models::{
+        chat::{ChatFailure, ChatPage, ChatSummary, StreamEvent, valid_id},
+        tools::{ToolRequest, ToolResult},
+    },
 };
 use serde_json::Value;
 use std::io::Read;
@@ -20,6 +23,22 @@ pub trait ChatApi: Send + Sync {
         } else {
             Err(ChatFailure::InvalidInput)
         }
+    }
+    fn send_tools_with_files(
+        &self,
+        chat: Option<&str>,
+        text: &str,
+        file_ids: &[String],
+    ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        self.send_with_files(chat, text, file_ids)
+    }
+    fn submit_tool_result(
+        &self,
+        _chat: &str,
+        _output: &str,
+        _result: &ToolResult,
+    ) -> Result<(), ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
     }
     fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure>;
     fn history(&self, id: &str) -> Result<ChatPage, ChatFailure>;
@@ -91,6 +110,7 @@ pub struct ChatState {
     pub expected_ms: Option<u64>,
     pub complete: bool,
     pub total_ms: Option<u64>,
+    pub tool_request: Option<ToolRequest>,
 }
 
 impl ChatState {
@@ -107,6 +127,12 @@ impl ChatState {
                     .as_str()
                     .ok_or(ChatFailure::InvalidResponse)?,
             ),
+            "tool_call" => {
+                if self.tool_request.is_some() {
+                    return Err(ChatFailure::InvalidResponse);
+                }
+                self.tool_request = Some(ToolRequest::from_event(&event.data)?);
+            }
             "stage" => {
                 if event.data["stage"] == "accept"
                     && event.data["status"] == "started"

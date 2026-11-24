@@ -102,6 +102,54 @@ fn actual_tokens_and_actual_estimates_drive_state() {
 }
 
 #[test]
+fn typed_tool_call_is_validated_and_bound_to_its_server_id() {
+    let mut state = ChatState::default();
+    let request = StreamEvent::from_payload(
+        Some(1),
+        "tool_call".into(),
+        json!({
+            "message":"Tool requested",
+            "data":{
+                "call_id":"30000000-0000-4000-8000-000000000003",
+                "name":"view_file",
+                "arguments":{"path":"Cargo.toml","start_line":1,"end_line":10}
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    assert!(state.apply(&request).unwrap());
+    let request = state.tool_request.unwrap();
+    assert_eq!(request.name.as_str(), "view_file");
+    assert_eq!(request.call_id, "30000000-0000-4000-8000-000000000003");
+    assert_eq!(request.arguments["path"], "Cargo.toml");
+}
+
+#[test]
+fn typed_tool_call_rejects_unknown_fields_names_and_invalid_ids() {
+    for data in [
+        json!({"call_id":"30000000-0000-4000-8000-000000000003","name":"view_file","arguments":{"path":"Cargo.toml","unexpected":true}}),
+        json!({"call_id":"30000000-0000-4000-8000-000000000003","name":"unknown_tool","arguments":{}}),
+        json!({"call_id":"not-a-uuid","name":"view_file","arguments":{"path":"Cargo.toml"}}),
+        json!({"call_id":"30000000-0000-4000-8000-000000000003","name":"view_file","arguments":{"path":"../secret"},"extra":true}),
+    ] {
+        let event = StreamEvent::from_payload(
+            Some(1),
+            "tool_call".into(),
+            json!({"message":"Tool requested","data":data})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            ChatState::default().apply(&event),
+            Err(ChatFailure::InvalidResponse)
+        );
+    }
+}
+
+#[test]
 fn eof_does_not_fabricate_a_completed_output() {
     let source = frame(1, "token", json!({"text":"partial"}));
     let mut state = ChatState::default();
