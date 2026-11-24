@@ -9,6 +9,18 @@ use std::io::Read;
 
 pub trait ChatApi: Send + Sync {
     fn send(&self, chat: Option<&str>, text: &str) -> Result<Box<dyn Read + Send>, ChatFailure>;
+    fn send_with_files(
+        &self,
+        chat: Option<&str>,
+        text: &str,
+        file_ids: &[String],
+    ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        if file_ids.is_empty() {
+            self.send(chat, text)
+        } else {
+            Err(ChatFailure::InvalidInput)
+        }
+    }
     fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure>;
     fn history(&self, id: &str) -> Result<ChatPage, ChatFailure>;
     fn reconnect(
