@@ -33,6 +33,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+const KITTY_HOLD_THRESHOLD: Duration = Duration::from_millis(260);
+const FALLBACK_TAP_TIMEOUT: Duration = Duration::from_millis(700);
+const FALLBACK_RELEASE_TIMEOUT: Duration = Duration::from_millis(350);
+
+fn transcribe_in_background(
+    recorder: crate::dal::local::voice::Recorder,
+) -> Result<
+    mpsc::Receiver<Result<String, crate::dal::local::voice::VoiceFailure>>,
+    crate::dal::local::voice::VoiceFailure,
+> {
+    use crate::dal::local::voice;
+    let samples = recorder.stop()?;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(voice::transcribe(&samples));
+    });
+    Ok(receiver)
+}
+
 fn failure(error: impl ToString) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -122,6 +141,7 @@ fn interactive<G: ChatApi + 'static>(
     out: &mut impl Write,
 ) -> io::Result<()> {
     let _raw = RawTerminal::enter(out)?;
+    let reports_key_releases = _raw.reports_key_releases();
     let colour = std::env::var_os("NO_COLOR").is_none();
     terminal::logo(out, colour)?;
     let (width, height) = crossterm::terminal::size()?;
@@ -157,6 +177,13 @@ fn interactive<G: ChatApi + 'static>(
     let mut cleaner = TerminalText::default();
     let mut stop_requested = false;
     let mut dirty = true;
+    let mut pending_space: Option<Instant> = None;
+    let mut recording: Option<(crate::dal::local::voice::Recorder, Instant, bool)> = None;
+    let mut last_repeat: Option<Instant> = None;
+    let mut voice_receiver: Option<
+        mpsc::Receiver<Result<String, crate::dal::local::voice::VoiceFailure>>,
+    > = None;
+    let mut voice_status: Option<String> = None;
     if let (Some(chat_id), Some(output_id)) = (chat.clone(), running) {
         let (tx, rx) = mpsc::channel();
         receiver = Some(rx);
@@ -179,6 +206,61 @@ fn interactive<G: ChatApi + 'static>(
         });
     }
     loop {
+        let now = Instant::now();
+        if let Some(pending) = pending_space {
+            if reports_key_releases && now.duration_since(pending) >= KITTY_HOLD_THRESHOLD {
+                pending_space = None;
+                match crate::dal::local::voice::Recorder::start() {
+                    Ok(recorder) => recording = Some((recorder, now, true)),
+                    Err(error) => voice_status = Some(error.to_string()),
+                }
+            } else if !reports_key_releases && now.duration_since(pending) >= FALLBACK_TAP_TIMEOUT {
+                pending_space = None;
+                editor.insert(" ");
+                dirty = true;
+            }
+        }
+        if let Some((_, started_at, fallback)) = recording.as_ref() {
+            voice_status = Some(format!(
+                "● Recording locally  {:.1}s  Esc cancels",
+                started_at.elapsed().as_secs_f64()
+            ));
+            if *fallback
+                && last_repeat
+                    .is_some_and(|last| now.duration_since(last) >= FALLBACK_RELEASE_TIMEOUT)
+            {
+                let (recorder, _, _) = recording.take().expect("recording is present");
+                last_repeat = None;
+                match transcribe_in_background(recorder) {
+                    Ok(receiver) => {
+                        voice_receiver = Some(receiver);
+                        voice_status = Some("Transcribing locally...".into());
+                    }
+                    Err(error) => voice_status = Some(error.to_string()),
+                }
+            }
+        }
+        if let Some(rx) = voice_receiver.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(text)) => {
+                    editor.insert(&text);
+                    voice_receiver = None;
+                    voice_status = None;
+                    dirty = true;
+                }
+                Ok(Err(error)) => {
+                    voice_receiver = None;
+                    voice_status = Some(error.to_string());
+                    dirty = true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    voice_receiver = None;
+                    voice_status = Some("Local speech transcription failed.".into());
+                    dirty = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(rx) = receiver.as_ref() {
             let mut finished = false;
             loop {
@@ -227,7 +309,7 @@ fn interactive<G: ChatApi + 'static>(
                 dirty = true;
             }
         }
-        if dirty || receiver.is_some() {
+        if dirty || receiver.is_some() || recording.is_some() || voice_receiver.is_some() {
             surface.paint(
                 out,
                 &state,
@@ -238,6 +320,7 @@ fn interactive<G: ChatApi + 'static>(
                 } else {
                     None
                 },
+                voice_status.as_deref(),
             )?;
             dirty = false;
         }
@@ -248,12 +331,73 @@ fn interactive<G: ChatApi + 'static>(
         match event::read()? {
             Event::Resize(w, h) => surface.resize(out, w, h)?,
             Event::Paste(text) if receiver.is_none() => editor.insert(&text),
+            Event::Key(key)
+                if key.kind == KeyEventKind::Release
+                    && reports_key_releases
+                    && key.code == KeyCode::Char(' ') =>
+            {
+                if let Some((recorder, _, true)) = recording.take() {
+                    match transcribe_in_background(recorder) {
+                        Ok(receiver) => {
+                            voice_receiver = Some(receiver);
+                            voice_status = Some("Transcribing locally...".into());
+                        }
+                        Err(error) => voice_status = Some(error.to_string()),
+                    }
+                } else if pending_space.take().is_some() {
+                    editor.insert(" ");
+                }
+            }
+            Event::Key(key)
+                if key.kind != KeyEventKind::Release
+                    && receiver.is_none()
+                    && voice_receiver.is_none()
+                    && key.code == KeyCode::Char(' ') =>
+            {
+                let now = Instant::now();
+                if let Some((_, _, true)) = recording.as_ref() {
+                    continue;
+                }
+                if let Some((_, _, false)) = recording.as_ref() {
+                    last_repeat = Some(now);
+                } else if let Some(pending) = pending_space {
+                    if now.duration_since(pending) >= KITTY_HOLD_THRESHOLD {
+                        match crate::dal::local::voice::Recorder::start() {
+                            Ok(recorder) => {
+                                recording = Some((recorder, now, false));
+                                last_repeat = Some(now);
+                            }
+                            Err(error) => voice_status = Some(error.to_string()),
+                        }
+                        pending_space = None;
+                    }
+                } else {
+                    pending_space = Some(now);
+                }
+            }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if let Some(pending) = pending_space.take()
+                    && (!reports_key_releases
+                        || Instant::now().duration_since(pending) < KITTY_HOLD_THRESHOLD)
+                {
+                    editor.insert(" ");
+                }
                 let control = key.modifiers.contains(KeyModifiers::CONTROL);
                 if control && matches!(key.code, KeyCode::Char('o' | 'O')) {
                     expanded = !expanded;
                     #[cfg(test)]
                     tests::DETAIL_STATES.lock().unwrap().push(expanded);
+                    continue;
+                }
+                if recording.is_some() {
+                    if key.code == KeyCode::Esc {
+                        recording = None;
+                        last_repeat = None;
+                        voice_status = Some("Recording cancelled.".into());
+                    }
+                    continue;
+                }
+                if voice_receiver.is_some() {
                     continue;
                 }
                 if control && matches!(key.code, KeyCode::Char('c' | 'C')) {

@@ -9,6 +9,7 @@
 
 
 ### Features
+- Add local hold-to-talk input (#10)
 - Add native Asodya sign-in and OS keyring storage
 - Merge native Asodya sign-in
 - Add Cortex chat streaming and inline activity view

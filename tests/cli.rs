@@ -45,6 +45,26 @@ fn invalid_arguments_fail_without_echoing_potential_credentials() {
     }
 }
 
+#[test]
+fn help_documents_voice_model_removal_and_space_dictation() {
+    let output = run(&["--help"]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("voice --remove-model"));
+    assert!(text.contains("hold Space to dictate"));
+}
+
+#[test]
+fn voice_model_removal_command_is_parsed_without_exposing_arguments() {
+    use cortex_cli::presentation::cli::commands::{self, Command};
+    let args = ["voice", "--remove-model"]
+        .into_iter()
+        .map(std::ffi::OsString::from);
+    assert!(matches!(
+        commands::parse(args),
+        Ok(Command::RemoveVoiceModel)
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn invalid_utf8_argument_fails() {
