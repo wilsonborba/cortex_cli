@@ -1,0 +1,21 @@
+[package]
+name = "cortex-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cortex command-line client for macOS and Linux"
+publish = false
+
+[[bin]]
+name = "cortex"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
