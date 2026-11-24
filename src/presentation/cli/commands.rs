@@ -2,10 +2,12 @@
 
 use std::ffi::OsString;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Help,
     Version,
+    Login,
+    Logout,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,6 +26,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
         Some(value) => match value.to_str() {
             Some("--help" | "-h") => Command::Help,
             Some("--version" | "-V") => Command::Version,
+            Some("login") => Command::Login,
+            Some("logout") => Command::Logout,
             _ => return Err(ParseError),
         },
     };

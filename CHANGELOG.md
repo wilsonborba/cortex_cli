@@ -5,6 +5,11 @@
 ### Documentation
 - Document owner Mac verification without hosted CI
 - Clarify public macOS build instructions
+- Merge bootstrap review corrections
+
+
+### Features
+- Add native Asodya sign-in and OS keyring storage
 
 
 ### Maintenance
