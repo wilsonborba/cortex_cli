@@ -16,6 +16,7 @@ pub struct ChatOptions {
     pub prompt: Option<String>,
     pub conversation: Option<String>,
     pub continue_latest: bool,
+    pub remote_control: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -61,6 +62,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
                 }
                 options.continue_latest = true;
             }
+            "--remote-control" | "--remote" => {
+                if options.remote_control {
+                    return Err(ParseError);
+                }
+                options.remote_control = true;
+            }
             "--conversation" | "--resume" | "-r" => {
                 if options.continue_latest || options.conversation.is_some() {
                     return Err(ParseError);
@@ -73,6 +80,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
             }
             _ => return Err(ParseError),
         }
+    }
+    if options.remote_control && options.prompt.is_some() {
+        return Err(ParseError);
     }
     Ok(Command::Chat(options))
 }

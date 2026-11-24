@@ -9,6 +9,7 @@
 
 
 ### Features
+- Add phone remote control for interactive Cortex sessions
 - Add native Asodya sign-in and OS keyring storage
 - Merge native Asodya sign-in
 - Add Cortex chat streaming and inline activity view
@@ -30,6 +31,7 @@
 
 
 ### Tests
+- Cover remote session routes, SSE decoding, cursors, and file references
 - Reject mismatched native handoff credentials in fixtures
 - Cover chat history scope and fractional timestamps
 - Verify terminal detail toggle states through real key input

@@ -11,6 +11,7 @@ use crate::domain::{
     models::{
         chat::{ChatFailure, ChatPage, ChatSummary, valid_id},
         native_auth::Session,
+        remote_control::{RemoteEvent, RemoteEventKind, RemoteSession},
     },
     services::chat::ChatApi,
 };
@@ -105,23 +106,146 @@ impl CortexClient {
             .map_err(|_| ChatFailure::Connection)?;
         Self::json(Self::checked(response)?)
     }
+
+    pub fn register_remote_session(&self) -> Result<RemoteSession, ChatFailure> {
+        let request = self
+            .client
+            .post(format!("{}/remote/sessions", self.base))
+            .json(&json!({
+                "device_name": "Cortex CLI",
+                "platform": std::env::consts::OS
+            }));
+        let response = self
+            .authenticated(request, true)
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let value = Self::json(Self::checked(response)?)?;
+        let remote: RemoteSession = serde_json::from_value(value["data"].clone())
+            .map_err(|_| ChatFailure::InvalidResponse)?;
+        if !valid_id(&remote.session_id) || !remote.online {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        Ok(remote)
+    }
+
+    pub fn unregister_remote_session(&self, session: &str) -> Result<(), ChatFailure> {
+        if !valid_id(session) {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let request = self
+            .client
+            .delete(format!("{}/remote/sessions/{session}", self.base))
+            .timeout(Duration::from_secs(20));
+        let response = self
+            .authenticated(request, true)
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        Self::checked(response).map(|_| ())
+    }
+
+    pub fn remote_commands(
+        &self,
+        session: &str,
+        cursor: u64,
+    ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        if !valid_id(session) {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let request = self
+            .client
+            .get(format!(
+                "{}/remote/sessions/{session}/commands?cursor={cursor}",
+                self.base
+            ))
+            .header("Accept", "text/event-stream");
+        let response = self
+            .authenticated(request, false)
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let response = Self::checked(response)?;
+        let kind = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if kind != "text/event-stream" {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        Ok(Box::new(response))
+    }
+
+    pub fn post_remote_event(
+        &self,
+        session: &str,
+        kind: RemoteEventKind,
+        payload: Value,
+        ack_command_id: Option<u64>,
+    ) -> Result<RemoteEvent, ChatFailure> {
+        if !valid_id(session) {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let request = self
+            .client
+            .post(format!("{}/remote/sessions/{session}/events", self.base))
+            .timeout(Duration::from_secs(20))
+            .json(&json!({
+                "kind": kind,
+                "payload": payload,
+                "ack_command_id": ack_command_id
+            }));
+        let response = self
+            .authenticated(request, true)
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let value = Self::json(Self::checked(response)?)?;
+        serde_json::from_value(value["data"].clone()).map_err(|_| ChatFailure::InvalidResponse)
+    }
+
+    pub fn acknowledge_remote_command(
+        &self,
+        session: &str,
+        command_id: u64,
+        status: &str,
+    ) -> Result<(), ChatFailure> {
+        self.post_remote_event(
+            session,
+            RemoteEventKind::Progress,
+            json!({ "status": status, "command_id": command_id }),
+            Some(command_id),
+        )
+        .map(|_| ())
+    }
 }
 
 impl ChatApi for CortexClient {
     fn send(&self, chat: Option<&str>, text: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        self.send_with_files(chat, text, &[])
+    }
+
+    fn send_with_files(
+        &self,
+        chat: Option<&str>,
+        text: &str,
+        file_ids: &[String],
+    ) -> Result<Box<dyn Read + Send>, ChatFailure> {
         if text.trim().is_empty() {
             return Err(ChatFailure::InvalidInput);
         }
+        let mut input = json!({"text":text,"stream":true});
+        if !file_ids.is_empty() {
+            input["file_ids"] = json!(file_ids);
+        }
         let (path, body) = match chat {
-            Some(id) if valid_id(id) => (
-                format!("/chats/{id}/inputs"),
-                json!({"text":text,"stream":true}),
-            ),
+            Some(id) if valid_id(id) => (format!("/chats/{id}/inputs"), input),
             Some(_) => return Err(ChatFailure::InvalidInput),
-            None => (
-                "/chats".into(),
-                json!({"app_id":"cortex","text":text,"stream":true}),
-            ),
+            None => {
+                input["app_id"] = json!("cortex");
+                ("/chats".into(), input)
+            }
         };
         let request = self
             .client
@@ -345,5 +469,97 @@ mod tests {
             Err(ChatFailure::InvalidResponse)
         ));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn remote_session_registration_and_unregistration_use_the_authenticated_routes() {
+        let registration = json!({
+            "message":"Remote session registered",
+            "data":{
+                "session_id":CHAT,
+                "device_name":"Cortex CLI",
+                "platform":std::env::consts::OS,
+                "last_seen_ms":123,
+                "online":true
+            }
+        });
+        let (client, worker) = server(201, "application/json", registration.to_string());
+        let session = client.register_remote_session().unwrap();
+        assert_eq!(session.session_id, CHAT);
+        let request = worker.join().unwrap();
+        assert!(request.starts_with("POST /apps/cortex/v1/remote/sessions HTTP/1.1"));
+        let lower = request.to_lowercase();
+        assert!(lower.contains("cookie: sid=fixture-session; csrf=fixture-csrf"));
+        assert!(lower.contains("x-csrf-token: fixture-csrf"));
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body,
+            json!({"device_name":"Cortex CLI","platform":std::env::consts::OS})
+        );
+
+        let (client, worker) = server(
+            200,
+            "application/json",
+            json!({"message":"Remote session unregistered","data":{"session_id":CHAT}}).to_string(),
+        );
+        client.unregister_remote_session(CHAT).unwrap();
+        assert!(worker.join().unwrap().starts_with(&format!(
+            "DELETE /apps/cortex/v1/remote/sessions/{CHAT} HTTP/1.1"
+        )));
+    }
+
+    #[test]
+    fn remote_commands_use_the_cursor_and_remote_events_match_the_api_contract() {
+        let (client, worker) = server(200, "text/event-stream", String::new());
+        drop(client.remote_commands(CHAT, 42).unwrap());
+        let request = worker.join().unwrap();
+        assert!(request.starts_with(&format!(
+            "GET /apps/cortex/v1/remote/sessions/{CHAT}/commands?cursor=42 HTTP/1.1"
+        )));
+        assert!(request.to_lowercase().contains("accept: text/event-stream"));
+
+        let response = json!({"message":"Remote event recorded","data":{
+            "id":7,"kind":"progress","payload":{"status":"command_received","command_id":6},"created_at_ms":321
+        }});
+        let (client, worker) = server(201, "application/json", response.to_string());
+        client
+            .acknowledge_remote_command(CHAT, 6, "command_received")
+            .unwrap();
+        let request = worker.join().unwrap();
+        assert!(request.starts_with(&format!(
+            "POST /apps/cortex/v1/remote/sessions/{CHAT}/events HTTP/1.1"
+        )));
+        assert!(
+            request
+                .to_lowercase()
+                .contains("x-csrf-token: fixture-csrf")
+        );
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "kind":"progress",
+                "payload":{"status":"command_received","command_id":6},
+                "ack_command_id":6
+            })
+        );
+    }
+
+    #[test]
+    fn remote_prompt_file_ids_are_sent_only_as_explicit_existing_references() {
+        let (client, worker) = server(200, "text/event-stream", String::new());
+        drop(
+            client
+                .send_with_files(None, "look at this", &["fsm-ref".to_owned()])
+                .unwrap(),
+        );
+        let request = worker.join().unwrap();
+        assert!(request.starts_with("POST /apps/cortex/v1/chats HTTP/1.1"));
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["file_ids"], json!(["fsm-ref"]));
+        assert_eq!(body["app_id"], "cortex");
+        assert_eq!(body["text"], "look at this");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body.as_object().unwrap().len(), 4);
     }
 }
