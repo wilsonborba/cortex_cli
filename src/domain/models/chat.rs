@@ -12,6 +12,7 @@ pub enum ChatFailure {
     IncompleteStream,
     Rejected(Option<u16>),
     InvalidInput,
+    RunningOutput,
 }
 
 impl fmt::Display for ChatFailure {
@@ -30,6 +31,9 @@ impl fmt::Display for ChatFailure {
             }
             Self::Rejected(None) => f.write_str("Cortex could not complete the request."),
             Self::InvalidInput => f.write_str("Enter a prompt or a valid conversation identifier."),
+            Self::RunningOutput => f.write_str(
+                "This conversation has a running output. Resume it after the output finishes.",
+            ),
         }
     }
 }

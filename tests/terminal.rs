@@ -91,7 +91,7 @@ fn mapped_flags_reject_extra_or_private_arguments_without_echo() {
     let args = |values: &[&str]| {
         values
             .iter()
-            .map(std::ffi::OsString::from)
+            .map(|value| std::ffi::OsString::from(*value))
             .collect::<Vec<_>>()
     };
     assert!(matches!(

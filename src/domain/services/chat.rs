@@ -43,6 +43,9 @@ pub fn owned_history(api: &impl ChatApi, id: &str) -> Result<ChatPage, ChatFailu
     if page.chat.app_id != "cortex" {
         return Err(ChatFailure::InvalidInput);
     }
+    if page.outputs.iter().any(|output| output.status == "running") {
+        return Err(ChatFailure::RunningOutput);
+    }
     Ok(page)
 }
 

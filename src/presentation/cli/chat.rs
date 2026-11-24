@@ -78,14 +78,6 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
         .map(|id| owned_history(api.as_ref(), id))
         .transpose()
         .map_err(failure)?;
-    if history
-        .as_ref()
-        .is_some_and(|page| page.outputs.iter().any(|output| output.status == "running"))
-    {
-        return Err(failure(
-            "This conversation has a running output. Resume it after the output finishes.",
-        ));
-    }
     if options.continue_latest && chat.is_none() {
         return Err(failure("No Cortex conversation is available to continue."));
     }
