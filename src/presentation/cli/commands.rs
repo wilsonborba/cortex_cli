@@ -2,12 +2,20 @@
 
 use std::ffi::OsString;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum Command {
     Help,
     Version,
     Login,
     Logout,
+    Chat(ChatOptions),
+}
+
+#[derive(Default, PartialEq, Eq)]
+pub struct ChatOptions {
+    pub prompt: Option<String>,
+    pub conversation: Option<String>,
+    pub continue_latest: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -20,19 +28,51 @@ impl ParseError {
 }
 
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseError> {
-    let mut args = args.into_iter();
-    let command = match args.next() {
-        None => Command::Help,
-        Some(value) => match value.to_str() {
-            Some("--help" | "-h") => Command::Help,
-            Some("--version" | "-V") => Command::Version,
-            Some("login") => Command::Login,
-            Some("logout") => Command::Logout,
-            _ => return Err(ParseError),
-        },
-    };
-    if args.next().is_some() {
-        return Err(ParseError);
+    let values: Vec<String> = args
+        .into_iter()
+        .map(|s| s.into_string().map_err(|_| ParseError))
+        .collect::<Result<_, _>>()?;
+    if values.len() == 1 {
+        match values[0].as_str() {
+            "--help" | "-h" => return Ok(Command::Help),
+            "--version" | "-V" => return Ok(Command::Version),
+            "login" => return Ok(Command::Login),
+            "logout" => return Ok(Command::Logout),
+            _ => {}
+        }
     }
-    Ok(command)
+    let mut options = ChatOptions::default();
+    let mut args = values.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--print" | "-p" => {
+                if options.prompt.is_some() {
+                    return Err(ParseError);
+                }
+                let prompt = args.next().ok_or(ParseError)?;
+                if prompt.trim().is_empty() {
+                    return Err(ParseError);
+                }
+                options.prompt = Some(prompt.clone());
+            }
+            "--continue" | "-c" => {
+                if options.continue_latest || options.conversation.is_some() {
+                    return Err(ParseError);
+                }
+                options.continue_latest = true;
+            }
+            "--conversation" | "--resume" | "-r" => {
+                if options.continue_latest || options.conversation.is_some() {
+                    return Err(ParseError);
+                }
+                let id = args.next().ok_or(ParseError)?;
+                if !crate::domain::models::chat::valid_id(id) {
+                    return Err(ParseError);
+                }
+                options.conversation = Some(id.to_ascii_lowercase());
+            }
+            _ => return Err(ParseError),
+        }
+    }
+    Ok(Command::Chat(options))
 }

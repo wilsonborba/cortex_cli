@@ -9,5 +9,6 @@ pub fn execute(command: Command, output: &mut impl Write) -> io::Result<()> {
         Command::Help => output.write_all(formatters::help().as_bytes()),
         Command::Version => writeln!(output, "{}", formatters::version()),
         Command::Login | Command::Logout => super::auth::execute(command, output),
+        Command::Chat(options) => super::chat::execute(options, output),
     }
 }
