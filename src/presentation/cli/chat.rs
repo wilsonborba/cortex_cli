@@ -31,7 +31,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde_json::{Value, json};
 use std::{
     collections::{HashSet, VecDeque},
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -240,10 +240,28 @@ fn remote_listener(
     online: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
+    remote_listener_with(
+        |after| api.remote_commands(&session_id, after),
+        cursor,
+        sender,
+        online,
+        stop,
+    );
+}
+
+fn remote_listener_with<F>(
+    mut connect: F,
+    cursor: Arc<AtomicU64>,
+    sender: mpsc::Sender<RemoteEvent>,
+    online: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) where
+    F: FnMut(u64) -> Result<Box<dyn Read + Send>, ChatFailure>,
+{
     let mut attempt = 0;
     while !stop.load(Ordering::Relaxed) {
         let after = cursor.load(Ordering::Relaxed);
-        let connected = api.remote_commands(&session_id, after);
+        let connected = connect(after);
         match connected {
             Ok(mut stream) => {
                 online.store(true, Ordering::Relaxed);
@@ -876,11 +894,74 @@ mod tests {
     use super::*;
     use crate::domain::models::chat::ChatSummary;
     use serde_json::json;
-    use std::{collections::VecDeque, io::Read};
+    use std::{
+        collections::VecDeque,
+        io::{Cursor, Read},
+    };
     pub(super) static DETAIL_STATES: std::sync::Mutex<Vec<bool>> =
         std::sync::Mutex::new(Vec::new());
     static CANCELLATIONS: std::sync::Mutex<Vec<(String, String)>> =
         std::sync::Mutex::new(Vec::new());
+
+    struct AckWaitReader {
+        frame: Cursor<Vec<u8>>,
+        cursor: Arc<AtomicU64>,
+    }
+
+    impl Read for AckWaitReader {
+        fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+            let count = self.frame.read(target)?;
+            if count > 0 {
+                return Ok(count);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.cursor.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn remote_listener_reconnects_after_the_acknowledged_command_cursor() {
+        let cursor = Arc::new(AtomicU64::new(0));
+        let online = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+        let requested_cursors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = requested_cursors.clone();
+        let reader_cursor = cursor.clone();
+        let listener_cursor = cursor.clone();
+        let reconnect_stop = stop.clone();
+        let listener = thread::spawn(move || {
+            remote_listener_with(
+                move |after| {
+                    let mut seen = requests.lock().unwrap();
+                    seen.push(after);
+                    if seen.len() == 1 {
+                        let frame = "id: 7\ndata: {\"id\":7,\"kind\":\"prompt\",\"payload\":{\"prompt\":\"hello\",\"file_ids\":[]},\"created_at_ms\":7}\n\n";
+                        Ok::<Box<dyn Read + Send>, ChatFailure>(Box::new(AckWaitReader {
+                            frame: Cursor::new(frame.as_bytes().to_vec()),
+                            cursor: reader_cursor.clone(),
+                        }))
+                    } else {
+                        reconnect_stop.store(true, Ordering::Relaxed);
+                        Ok(Box::new(Cursor::new(Vec::new())))
+                    }
+                },
+                listener_cursor,
+                sender,
+                online,
+                stop,
+            );
+        });
+
+        let event = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(event.id, 7);
+        cursor.store(event.id, Ordering::Relaxed);
+        listener.join().unwrap();
+        assert_eq!(*requested_cursors.lock().unwrap(), vec![0, 7]);
+    }
 
     #[test]
     fn command_queue_deduplicates_replayed_prompts_across_acknowledged_cursor() {
