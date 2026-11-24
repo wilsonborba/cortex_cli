@@ -2,9 +2,25 @@
 name = "cortex-cli"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91.1"
 description = "Cortex command-line client for macOS and Linux"
 publish = false
+
+[dependencies]
+base64 = "=0.22.1"
+fernet = { version = "=0.2.2", default-features = false, features = ["rustcrypto"] }
+rand = "=0.9.5"
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+sha2 = "=0.10.9"
+zeroize = "=1.9.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", features = ["apple-native"] }
 
 [[bin]]
 name = "cortex"

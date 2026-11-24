@@ -3,5 +3,10 @@
 //! Gateway, Cortex API and external provider transports belong in `remote`.
 //! Keyring and local persistence adapters belong in `local`.
 
-pub mod local {}
-pub mod remote {}
+pub mod local {
+    pub mod session;
+}
+pub mod remote {
+    pub mod gateway;
+    pub mod login_context;
+}

@@ -11,8 +11,17 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
-                Err(_) => {
-                    crate::core::logs::error("cannot write terminal output");
+                Err(error) => {
+                    // All adapter failures reach this boundary as fixed, safe messages.
+                    let message = if matches!(
+                        command,
+                        commands::Command::Login | commands::Command::Logout
+                    ) {
+                        error.to_string()
+                    } else {
+                        "cannot write terminal output".to_owned()
+                    };
+                    crate::core::logs::error(&message);
                     ExitCode::FAILURE
                 }
             }

@@ -1,4 +1,8 @@
 //! Business data and services. No terminal or transport behavior belongs here.
 
-pub mod models {}
-pub mod services {}
+pub mod models {
+    pub mod native_auth;
+}
+pub mod services {
+    pub mod auth;
+}

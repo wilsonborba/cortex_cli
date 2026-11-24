@@ -3,7 +3,7 @@
 use crate::core::settings;
 
 pub fn help() -> &'static str {
-    "Cortex - command-line client for macOS and Linux\n\nUsage: cortex [OPTIONS]\n\nOptions:\n  -h, --help     Show this help\n  -V, --version  Show the version\n\nThis bootstrap build provides help and version information.\n"
+    "Cortex - command-line client for macOS and Linux\n\nUsage: cortex [COMMAND] [OPTIONS]\n\nCommands:\n  login          Sign in to Asodya through the browser\n  logout         Sign out of this device\n\nOptions:\n  -h, --help     Show this help\n  -V, --version  Show the version\n"
 }
 
 pub fn version() -> String {
