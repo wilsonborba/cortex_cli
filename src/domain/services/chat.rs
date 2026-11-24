@@ -40,13 +40,32 @@ pub fn latest_chat(api: &impl ChatApi) -> Result<Option<String>, ChatFailure> {
 
 pub fn owned_history(api: &impl ChatApi, id: &str) -> Result<ChatPage, ChatFailure> {
     let page = api.history(id)?;
-    if page.chat.app_id != "cortex" {
+    if page.chat.app_id != "cortex" || !page.chat.session_id.eq_ignore_ascii_case(id) {
         return Err(ChatFailure::InvalidInput);
     }
-    if page.outputs.iter().any(|output| output.status == "running") {
+    running_output(&page)?;
+    Ok(page)
+}
+
+/// Resume only the output explicitly returned in the requested owned chat page.
+pub fn running_output(page: &ChatPage) -> Result<Option<String>, ChatFailure> {
+    let mut outputs = page
+        .outputs
+        .iter()
+        .filter(|output| output.status == "running");
+    let selected = outputs.next();
+    if outputs.next().is_some() {
         return Err(ChatFailure::RunningOutput);
     }
-    Ok(page)
+    selected
+        .map(|output| {
+            if valid_id(&output.output_id) {
+                Ok(output.output_id.clone())
+            } else {
+                Err(ChatFailure::InvalidResponse)
+            }
+        })
+        .transpose()
 }
 
 #[derive(Default)]
@@ -77,6 +96,13 @@ impl ChatState {
                     .ok_or(ChatFailure::InvalidResponse)?,
             ),
             "stage" => {
+                if event.data["stage"] == "accept"
+                    && event.data["status"] == "started"
+                    && (event.data.get("session_id").is_some()
+                        || event.data.get("output_id").is_some())
+                {
+                    self.identify(&event.data)?;
+                }
                 self.stage = event.data["stage"]
                     .as_str()
                     .ok_or(ChatFailure::InvalidResponse)?
@@ -130,23 +156,7 @@ impl ChatState {
             }
             "sources" | "memories" => self.push_activity(event.message.clone()),
             "done" => {
-                let chat = event.data["session_id"]
-                    .as_str()
-                    .filter(|id| valid_id(id))
-                    .ok_or(ChatFailure::InvalidResponse)?;
-                let output = event.data["output_id"]
-                    .as_str()
-                    .filter(|id| valid_id(id))
-                    .ok_or(ChatFailure::InvalidResponse)?;
-                if self
-                    .chat_id
-                    .as_ref()
-                    .is_some_and(|expected| !expected.eq_ignore_ascii_case(chat))
-                {
-                    return Err(ChatFailure::InvalidResponse);
-                }
-                self.chat_id = Some(chat.into());
-                self.output_id = Some(output.into());
+                self.identify(&event.data)?;
                 self.total_ms = Some(
                     event.data["total_ms"]
                         .as_u64()
@@ -157,6 +167,31 @@ impl ChatState {
             _ => {}
         }
         Ok(true)
+    }
+
+    fn identify(&mut self, data: &Value) -> Result<(), ChatFailure> {
+        let chat = data["session_id"]
+            .as_str()
+            .filter(|id| valid_id(id))
+            .ok_or(ChatFailure::InvalidResponse)?;
+        let output = data["output_id"]
+            .as_str()
+            .filter(|id| valid_id(id))
+            .ok_or(ChatFailure::InvalidResponse)?;
+        if self
+            .chat_id
+            .as_ref()
+            .is_some_and(|id| !id.eq_ignore_ascii_case(chat))
+            || self
+                .output_id
+                .as_ref()
+                .is_some_and(|id| !id.eq_ignore_ascii_case(output))
+        {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        self.chat_id = Some(chat.to_owned());
+        self.output_id = Some(output.to_owned());
+        Ok(())
     }
 
     fn push_activity(&mut self, text: String) {
@@ -189,6 +224,39 @@ pub fn consume(
             if terminal {
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Recover transport loss with the exact accepted identity and event cursor.
+/// A failed POST is never repeated, because it may already have been accepted.
+pub fn follow(
+    api: &impl ChatApi,
+    mut stream: Box<dyn Read + Send>,
+    state: &mut ChatState,
+    mut sink: impl FnMut(StreamEvent) -> Result<(), ChatFailure>,
+) -> Result<(), ChatFailure> {
+    let mut retries = 0;
+    loop {
+        let result = consume(stream, |event| {
+            if state.apply(&event)? {
+                sink(event)?;
+            }
+            Ok(())
+        });
+        match result {
+            Err(error @ (ChatFailure::Connection | ChatFailure::IncompleteStream))
+                if retries < 2 =>
+            {
+                let (Some(chat), Some(output)) =
+                    (state.chat_id.as_deref(), state.output_id.as_deref())
+                else {
+                    return Err(error);
+                };
+                retries += 1;
+                stream = api.reconnect(chat, output, state.last_event)?;
+            }
+            result => return result,
         }
     }
 }

@@ -8,7 +8,7 @@ pub mod local {
 }
 pub mod remote {
     pub mod chat;
-    pub mod sse;
     pub mod gateway;
     pub mod login_context;
+    pub mod sse;
 }

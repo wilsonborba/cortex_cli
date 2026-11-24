@@ -5,6 +5,6 @@ pub mod models {
     pub mod native_auth;
 }
 pub mod services {
-    pub mod chat;
     pub mod auth;
+    pub mod chat;
 }

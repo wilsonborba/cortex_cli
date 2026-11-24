@@ -1,6 +1,6 @@
 use cortex_cli::domain::{
     models::chat::{ChatFailure, ChatOutput, ChatPage, ChatSummary},
-    services::chat::{ChatApi, latest_chat, owned_history},
+    services::chat::{ChatApi, latest_chat, owned_history, running_output},
 };
 use std::io::Read;
 
@@ -73,10 +73,11 @@ fn finished_history_is_available_without_guessing_running_identifiers() {
     };
     assert!(owned_history(&api, FIRST).is_ok());
     api.running = true;
-    assert!(matches!(
-        owned_history(&api, FIRST),
-        Err(ChatFailure::RunningOutput)
-    ));
+    let page = owned_history(&api, FIRST).unwrap();
+    assert_eq!(running_output(&page).unwrap().as_deref(), Some(SECOND));
+    let mut ambiguous = page;
+    ambiguous.outputs.push(ambiguous.outputs[0].clone());
+    assert_eq!(running_output(&ambiguous), Err(ChatFailure::RunningOutput));
     api.running = false;
     api.app = "annotations";
     assert!(matches!(

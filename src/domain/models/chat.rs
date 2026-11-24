@@ -32,7 +32,7 @@ impl fmt::Display for ChatFailure {
             Self::Rejected(None) => f.write_str("Cortex could not complete the request."),
             Self::InvalidInput => f.write_str("Enter a prompt or a valid conversation identifier."),
             Self::RunningOutput => f.write_str(
-                "This conversation has a running output. Resume it after the output finishes.",
+                "This conversation has a running output. Resume without a new prompt, or wait for it to finish.",
             ),
         }
     }
@@ -52,7 +52,7 @@ pub struct ChatInput {
     pub text: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ChatOutput {
     pub output_id: String,
     pub input_id: String,

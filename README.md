@@ -71,11 +71,13 @@ Print mode writes answer text to stdout. Login prompts use stderr when needed.
 It does not add terminal colours to the answer. Set `NO_COLOR` to disable colour
 in the interactive client.
 
-The current server sends a new output's identifiers only when it completes.
-Until the early-identity contract is available, Ctrl+C disconnects that stream;
-the remote output continues. Resume a conversation after its running output
-finishes. Running-output cancellation and reconnect remain pending. No local
-commands or filesystem tools run from this chat client.
+Ctrl+C requests cancellation once the server accepts an output. If the
+connection fails after acceptance, the client reconnects to that exact output
+and continues after the last received event. It never resends a prompt on a
+connection failure. Before acceptance, Ctrl+C disconnects; the remote request
+may continue. Resume a running conversation without a new prompt to replay and
+follow its output. No local commands or filesystem tools run from this chat
+client.
 
 ## Checks
 

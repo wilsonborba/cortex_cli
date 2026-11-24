@@ -21,7 +21,7 @@ use crate::{
         },
         services::{
             auth::AuthService,
-            chat::{ChatApi, ChatState, consume, latest_chat, owned_history},
+            chat::{ChatApi, ChatState, follow, latest_chat, owned_history, running_output},
         },
     },
 };
@@ -82,15 +82,24 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
         return Err(failure("No Cortex conversation is available to continue."));
     }
     if let Some(prompt) = options.prompt {
+        if history
+            .as_ref()
+            .map(running_output)
+            .transpose()
+            .map_err(failure)?
+            .flatten()
+            .is_some()
+        {
+            return Err(failure(ChatFailure::RunningOutput));
+        }
         let mut state = ChatState {
             chat_id: chat.clone(),
             ..Default::default()
         };
         let mut text = TerminalText::default();
         let stream = api.send(chat.as_deref(), &prompt).map_err(failure)?;
-        consume(stream, |event| {
-            let accepted = state.apply(&event)?;
-            if accepted && event.name == "token" {
+        follow(api.as_ref(), stream, &mut state, |event| {
+            if event.name == "token" {
                 out.write_all(
                     text.push(event.data["text"].as_str().unwrap_or(""))
                         .as_bytes(),
@@ -117,16 +126,30 @@ fn interactive<G: ChatApi + 'static>(
     terminal::logo(out, colour)?;
     let (width, height) = crossterm::terminal::size()?;
     let mut surface = Surface::new(width, height, colour);
+    let running = history
+        .as_ref()
+        .map(running_output)
+        .transpose()
+        .map_err(failure)?
+        .flatten();
     if let Some(page) = history {
         for input in page.inputs.iter().rev() {
             surface.text(out, &format!("\n> {}\n", clean(&input.text)))?;
-            for output in page.outputs.iter().filter(|o| o.input_id == input.input_id) {
+            for output in page
+                .outputs
+                .iter()
+                .filter(|o| o.input_id == input.input_id && o.status != "running")
+            {
                 surface.text(out, &clean(&output.text))?;
                 surface.text(out, "\n")?;
             }
         }
     }
-    let mut state = ChatState::default();
+    let mut state = ChatState {
+        chat_id: chat.clone(),
+        output_id: running.clone(),
+        ..Default::default()
+    };
     let mut editor = Editor::default();
     let mut expanded = false;
     let mut receiver: Option<mpsc::Receiver<Result<StreamEvent, ChatFailure>>> = None;
@@ -134,6 +157,27 @@ fn interactive<G: ChatApi + 'static>(
     let mut cleaner = TerminalText::default();
     let mut stop_requested = false;
     let mut dirty = true;
+    if let (Some(chat_id), Some(output_id)) = (chat.clone(), running) {
+        let (tx, rx) = mpsc::channel();
+        receiver = Some(rx);
+        started = Some(Instant::now());
+        let api = api.clone();
+        thread::spawn(move || {
+            let mut state = ChatState {
+                chat_id: Some(chat_id.clone()),
+                output_id: Some(output_id.clone()),
+                ..Default::default()
+            };
+            let result = api.reconnect(&chat_id, &output_id, 0).and_then(|stream| {
+                follow(api.as_ref(), stream, &mut state, |event| {
+                    tx.send(Ok(event)).map_err(|_| ChatFailure::Connection)
+                })
+            });
+            if let Err(error) = result {
+                let _ = tx.send(Err(error));
+            }
+        });
+    }
     loop {
         if let Some(rx) = receiver.as_ref() {
             let mut finished = false;
@@ -220,6 +264,7 @@ fn interactive<G: ChatApi + 'static>(
                             if !stop_requested {
                                 api.cancel(chat, output).map_err(failure)?;
                                 stop_requested = true;
+                                surface.text(out, "\nCancellation requested.\n")?;
                             }
                         } else {
                             surface.text(out, "\nDisconnected. The remote output continues.\n")?;
@@ -255,8 +300,12 @@ fn interactive<G: ChatApi + 'static>(
                         let api = api.clone();
                         let id = chat.clone();
                         thread::spawn(move || {
+                            let mut state = ChatState {
+                                chat_id: id.clone(),
+                                ..Default::default()
+                            };
                             let result = api.send(id.as_deref(), &text).and_then(|stream| {
-                                consume(stream, |event| {
+                                follow(api.as_ref(), stream, &mut state, |event| {
                                     tx.send(Ok(event)).map_err(|_| ChatFailure::Connection)
                                 })
                             });
@@ -291,6 +340,8 @@ mod tests {
     use std::{collections::VecDeque, io::Read};
     pub(super) static DETAIL_STATES: std::sync::Mutex<Vec<bool>> =
         std::sync::Mutex::new(Vec::new());
+    static CANCELLATIONS: std::sync::Mutex<Vec<(String, String)>> =
+        std::sync::Mutex::new(Vec::new());
     struct Fixture;
     struct SlowFrames {
         frames: VecDeque<Vec<u8>>,
@@ -319,7 +370,7 @@ mod tests {
             let steps = [
                 (
                     "stage",
-                    json!({"stage":"gather","status":"started","expected_ms":null}),
+                    json!({"stage":"accept","status":"started","expected_ms":null,"session_id":"10000000-0000-4000-8000-000000000001","output_id":"20000000-0000-4000-8000-000000000002"}),
                 ),
                 (
                     "step",
@@ -362,8 +413,12 @@ mod tests {
         fn reconnect(&self, _: &str, _: &str, _: u64) -> Result<Box<dyn Read + Send>, ChatFailure> {
             Err(ChatFailure::InvalidInput)
         }
-        fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
-            Err(ChatFailure::InvalidInput)
+        fn cancel(&self, chat: &str, output: &str) -> Result<(), ChatFailure> {
+            CANCELLATIONS
+                .lock()
+                .unwrap()
+                .push((chat.into(), output.into()));
+            Ok(())
         }
     }
 
@@ -375,6 +430,21 @@ mod tests {
         write!(out, "\x1b[2J\x1b[H").unwrap();
         interactive(Arc::new(Fixture), None, None, &mut out).unwrap();
         assert_eq!(*DETAIL_STATES.lock().unwrap(), vec![true, false]);
+        assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
+    }
+    #[test]
+    #[ignore = "requires an interactive terminal; uses only in-memory fixture events"]
+    fn terminal_cancel_fixture() {
+        assert!(io::stdin().is_terminal());
+        let mut out = io::stdout().lock();
+        interactive(Arc::new(Fixture), None, None, &mut out).unwrap();
+        assert_eq!(
+            *CANCELLATIONS.lock().unwrap(),
+            vec![(
+                "10000000-0000-4000-8000-000000000001".to_owned(),
+                "20000000-0000-4000-8000-000000000002".to_owned()
+            )]
+        );
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     }
 }
