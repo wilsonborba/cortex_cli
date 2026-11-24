@@ -2,3 +2,4 @@
 
 pub mod logs;
 pub mod settings;
+pub mod terminal_text;
