@@ -206,7 +206,7 @@ fn interactive<G: ChatApi + 'static>(
                 if control && matches!(key.code, KeyCode::Char('o' | 'O')) {
                     expanded = !expanded;
                     #[cfg(test)]
-                    tests::DETAIL_TOGGLES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tests::DETAIL_STATES.lock().unwrap().push(expanded);
                     continue;
                 }
                 if control && matches!(key.code, KeyCode::Char('c' | 'C')) {
@@ -283,8 +283,8 @@ mod tests {
     use crate::domain::models::chat::ChatSummary;
     use serde_json::json;
     use std::{collections::VecDeque, io::Read};
-    pub(super) static DETAIL_TOGGLES: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    pub(super) static DETAIL_STATES: std::sync::Mutex<Vec<bool>> =
+        std::sync::Mutex::new(Vec::new());
     struct Fixture;
     struct SlowFrames {
         frames: VecDeque<Vec<u8>>,
@@ -368,7 +368,7 @@ mod tests {
         let mut out = io::stdout().lock();
         write!(out, "\x1b[2J\x1b[H").unwrap();
         interactive(Arc::new(Fixture), None, None, &mut out).unwrap();
-        assert!(DETAIL_TOGGLES.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert_eq!(*DETAIL_STATES.lock().unwrap(), vec![true, false]);
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     }
 }
