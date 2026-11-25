@@ -41,6 +41,16 @@ fn make_executable(path: &Path, contents: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
+fn host_target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        other => panic!("unsupported installer fixture host: {other:?}"),
+    }
+}
+
 fn make_archive(root: &Path, entry: EntryKind, extra_member: bool) -> PathBuf {
     let contents = root.join("archive-contents");
     fs::create_dir_all(&contents).unwrap();
@@ -82,7 +92,7 @@ fn manifest(root: &Path, archive: &Path, digest: Option<&str>, duplicate: bool) 
     let bytes = fs::read(archive).unwrap();
     let actual = format!("{:x}", Sha256::digest(bytes));
     let digest = digest.unwrap_or(&actual);
-    let name = "cortex-v0.1.0-x86_64-unknown-linux-gnu.tar.gz";
+    let name = format!("cortex-v0.1.0-{}.tar.gz", host_target());
     let line = format!("{digest}  {name}\n");
     let path = root.join("SHA256SUMS");
     fs::write(

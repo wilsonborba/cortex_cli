@@ -84,7 +84,19 @@ if [[ -e "$OUTPUT_DIR/$ASSET" ]]; then
 fi
 mkdir -p "$OUTPUT_DIR"
 STAGE="$(mktemp -d "$OUTPUT_DIR/.cortex-package.XXXXXX")"
-trap 'rm -rf "$STAGE"' EXIT
+PUBLISHED_ARCHIVE=""
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ -n "$PUBLISHED_ARCHIVE" && -e "$STAGE/$ASSET" && "$PUBLISHED_ARCHIVE" -ef "$STAGE/$ASSET" ]]; then
+    if ! awk -v name="$ASSET" -v digest="$DIGEST" '$1 == digest && $2 == name { found = 1 } END { exit !found }' "$OUTPUT_DIR/SHA256SUMS" 2>/dev/null; then
+      rm -f "$PUBLISHED_ARCHIVE"
+    fi
+  fi
+  rm -rf "$STAGE"
+  return "$status"
+}
+trap cleanup EXIT
 cp "$BINARY" "$STAGE/cortex"
 tar -czf "$STAGE/$ASSET" -C "$STAGE" cortex
 
@@ -106,6 +118,8 @@ else
   : > "$STAGE/SHA256SUMS"
 fi
 printf '%s  %s\n' "$DIGEST" "$ASSET" >> "$STAGE/SHA256SUMS"
-mv "$STAGE/$ASSET" "$OUTPUT_DIR/$ASSET"
+PUBLISHED_ARCHIVE="$OUTPUT_DIR/$ASSET"
+ln "$STAGE/$ASSET" "$PUBLISHED_ARCHIVE"
 mv "$STAGE/SHA256SUMS" "$OUTPUT_DIR/SHA256SUMS"
+PUBLISHED_ARCHIVE=""
 echo "Packaged $ASSET and updated $OUTPUT_DIR/SHA256SUMS."
