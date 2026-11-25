@@ -118,12 +118,18 @@ fn bounded(value: &str, max: usize) -> bool {
 
 impl ToolRequest {
     pub fn action_digest(&self) -> String {
+        // Match Cortex API exactly: lowercase hyphenated UUID text, NUL,
+        // snake_case tool name, NUL, recursively key-sorted JSON. Arrays keep
+        // their source order.
+        let call_id = self.call_id.to_ascii_lowercase();
+        let mut canonical_arguments = self.arguments.clone();
+        canonical_arguments.sort_all_objects();
         let mut hasher = Sha256::new();
-        hasher.update(self.call_id.as_bytes());
+        hasher.update(call_id.as_bytes());
         hasher.update([0]);
         hasher.update(self.name.as_str().as_bytes());
         hasher.update([0]);
-        hasher.update(self.arguments.to_string().as_bytes());
+        hasher.update(canonical_arguments.to_string().as_bytes());
         hasher
             .finalize()
             .iter()
@@ -140,7 +146,7 @@ impl ToolRequest {
             .as_str()
             .filter(|id| valid_id(id))
             .ok_or(ChatFailure::InvalidResponse)?
-            .to_owned();
+            .to_ascii_lowercase();
         let raw_name = data["name"].as_str().ok_or(ChatFailure::InvalidResponse)?;
         let arguments = data["arguments"].clone();
         if arguments.to_string().len() > 16 * 1024 {

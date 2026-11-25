@@ -98,10 +98,92 @@ fn view_file_rejects_zero_and_ranges_over_500_inclusive_lines() {
 }
 
 #[test]
-fn action_digest_matches_the_api_canonical_request_digest() {
-    let call = request("run_command", json!({"cwd":".","argv":["echo","ok"]}));
+fn action_digest_matches_shared_api_golden_and_canonicalizes_nested_objects() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/output_action_digest.json")).unwrap();
+    let call_id = fixture["call_id"].as_str().unwrap();
+    let parse_args = |raw: &str| serde_json::from_str::<serde_json::Value>(raw).unwrap();
+    let make_request = |call_id: &str, name: ToolName, arguments: serde_json::Value| ToolRequest {
+        call_id: call_id.to_owned(),
+        name,
+        arguments,
+    };
+    let first = parse_args(fixture["arguments_raw"][0].as_str().unwrap());
+    let expected = fixture["digest"].as_str().unwrap();
+
     assert_eq!(
-        call.action_digest(),
-        "52f61567c4934e6c0ea1da29e80bb22fe2f08756ad1fc28b81ddace856de9c33"
+        make_request(call_id, ToolName::RunCommand, first.clone()).action_digest(),
+        expected
+    );
+    assert_eq!(
+        make_request(
+            call_id,
+            ToolName::RunCommand,
+            parse_args(fixture["arguments_raw"][1].as_str().unwrap()),
+        )
+        .action_digest(),
+        expected,
+        "reordered nested object keys must preserve the digest"
+    );
+    assert_eq!(
+        make_request(
+            fixture["changed_call_id"]["value"].as_str().unwrap(),
+            ToolName::RunCommand,
+            first.clone(),
+        )
+        .action_digest(),
+        fixture["changed_call_id"]["digest"].as_str().unwrap()
+    );
+    assert_eq!(
+        make_request(call_id, ToolName::ViewFile, first.clone()).action_digest(),
+        fixture["changed_tool_name"]["digest"].as_str().unwrap()
+    );
+    assert_eq!(
+        make_request(
+            call_id,
+            ToolName::RunCommand,
+            parse_args(fixture["changed_arguments"]["raw"].as_str().unwrap()),
+        )
+        .action_digest(),
+        fixture["changed_arguments"]["digest"].as_str().unwrap()
+    );
+    assert_eq!(
+        make_request(
+            call_id,
+            ToolName::RunCommand,
+            parse_args(fixture["changed_array_order"]["raw"].as_str().unwrap()),
+        )
+        .action_digest(),
+        fixture["changed_array_order"]["digest"].as_str().unwrap(),
+        "array order must remain significant"
+    );
+    let mixed_case = "30000000-0000-4000-A000-000000000003";
+    let lowercase = mixed_case.to_ascii_lowercase();
+    assert_eq!(
+        make_request(mixed_case, ToolName::RunCommand, first.clone()).action_digest(),
+        make_request(&lowercase, ToolName::RunCommand, first).action_digest(),
+        "UUID text is normalized to lowercase canonical form"
+    );
+
+    let valid_args = parse_args(fixture["valid_command"]["arguments_raw"].as_str().unwrap());
+    let valid_request = ToolRequest::from_event(&json!({
+        "call_id":call_id,
+        "name":"run_command",
+        "arguments":valid_args
+    }))
+    .unwrap();
+    assert_eq!(
+        valid_request.action_digest(),
+        fixture["valid_command"]["digest"].as_str().unwrap()
+    );
+    let uppercase_uuid = ToolRequest::from_event(&json!({
+        "call_id":"30000000-0000-4000-A000-000000000003",
+        "name":"run_command",
+        "arguments":parse_args(fixture["valid_command"]["arguments_raw"].as_str().unwrap())
+    }))
+    .unwrap();
+    assert_eq!(
+        uppercase_uuid.call_id,
+        "30000000-0000-4000-a000-000000000003"
     );
 }
