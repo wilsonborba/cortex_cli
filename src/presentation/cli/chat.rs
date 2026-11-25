@@ -526,12 +526,8 @@ fn answer_pending_action(
     if !current.matches(&pending.request) {
         return Err(ChatFailure::InvalidResponse);
     }
-    let effective_approval = match current.status.as_str() {
-        "approved" => true,
-        "denied" => false,
-        "pending" => approved,
-        _ => return Err(ChatFailure::InvalidResponse),
-    };
+    let effective_approval =
+        effective_approval(&current.status, approved).ok_or(ChatFailure::InvalidResponse)?;
     let answered = if current.status == "pending" {
         api.answer_output_action(
             remote_session,
@@ -589,6 +585,15 @@ fn answer_pending_action(
     )?;
     state.pending_action = None;
     Ok(())
+}
+
+fn effective_approval(status: &str, requested: bool) -> Option<bool> {
+    match status {
+        "approved" => Some(true),
+        "denied" => Some(false),
+        "pending" => Some(requested),
+        _ => None,
+    }
 }
 
 impl RemoteCommandQueue {
@@ -1232,6 +1237,17 @@ mod tests {
         queue.enqueue(make_prompt(2), 1);
         assert_eq!(queue.pending.len(), 1);
         assert_eq!(queue.pending.front().unwrap().id, 2);
+    }
+
+    #[test]
+    fn first_server_decision_wins_over_a_later_terminal_or_phone_answer() {
+        assert_eq!(effective_approval("pending", true), Some(true));
+        assert_eq!(effective_approval("pending", false), Some(false));
+        assert_eq!(effective_approval("approved", false), Some(true));
+        assert_eq!(effective_approval("denied", true), Some(false));
+        assert_eq!(effective_approval("cancelled", true), None);
+        assert_eq!(effective_approval("expired", true), None);
+        assert_eq!(effective_approval("claimed", false), None);
     }
 
     struct Fixture;
