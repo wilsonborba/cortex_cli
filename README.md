@@ -15,7 +15,30 @@ cortex --version
 ```
 
 Cargo installs `cortex` into its bin directory. Add that directory to your `PATH`.
-No account or provider credential is needed for these commands.
+No account or provider credential is needed for these commands. A versioned
+release installer is prepared in `scripts/install.sh`; it downloads only the
+requested Linux or macOS build and verifies its SHA-256 entry before installing.
+Preview the selected asset and destination without network access or writes:
+
+```sh
+scripts/install.sh --version 0.1.0 --dry-run
+```
+
+For each native release build, stage its executable and checksum entry without
+publishing anything:
+
+```sh
+scripts/package-release.sh --version 0.1.0 --target x86_64-unknown-linux-gnu \
+  --binary target/release/cortex --output-dir /path/to/release-staging --dry-run
+```
+
+Run once per target in the same staging directory after reviewing the output.
+The package script writes a one-file archive and appends its SHA-256 entry to
+`SHA256SUMS`; release upload and tagging remain owner-controlled.
+
+The installer is usable only after an owner-authorized release publishes the
+matching archive and `SHA256SUMS` file. It does not edit shell configuration or
+sign in to Asodya. Linux may need the system D-Bus runtime for Secret Service.
 
 Linux builds also need the D-Bus development package and `pkg-config`. Debian and
 Ubuntu provide these as `libdbus-1-dev` and `pkg-config`. macOS uses the OS
