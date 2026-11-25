@@ -1,9 +1,9 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::Read,
+    io::{self, Read},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -25,6 +25,8 @@ pub enum ToolError {
     ReadFailed,
     ResultTooLarge,
     ActionCancelled,
+    ActionTimedOut,
+    ActionOutcomeUnknown,
 }
 
 impl std::fmt::Display for ToolError {
@@ -35,6 +37,10 @@ impl std::fmt::Display for ToolError {
             Self::ReadFailed => "The requested workspace content could not be read.",
             Self::ResultTooLarge => "The tool result exceeded the supported size.",
             Self::ActionCancelled => "The approved action was cancelled before completion.",
+            Self::ActionTimedOut => "The command was stopped at its time limit.",
+            Self::ActionOutcomeUnknown => {
+                "The command stopped before its outcome could be confirmed."
+            }
         })
     }
 }
@@ -186,39 +192,90 @@ fn run_command(
 ) -> Result<String, ToolError> {
     const MAX_COMMAND_OUTPUT: usize = 16 * 1024;
     const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-    let mut child = Command::new(&args.argv[0])
+    let mut command = Command::new(&args.argv[0]);
+    command
         .args(&args.argv[1..])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| ToolError::ReadFailed)?;
-    let stdout = child.stdout.take().ok_or(ToolError::ReadFailed)?;
-    let stderr = child.stderr.take().ok_or(ToolError::ReadFailed)?;
-    let stdout_reader = thread::spawn(move || read_capped(stdout, MAX_COMMAND_OUTPUT));
-    let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_COMMAND_OUTPUT));
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|_| ToolError::ReadFailed)?;
+    let mut stdout = child.stdout.take().ok_or(ToolError::ReadFailed)?;
+    let mut stderr = child.stderr.take().ok_or(ToolError::ReadFailed)?;
+    #[cfg(unix)]
+    if set_nonblocking(&stdout).is_err() || set_nonblocking(&stderr).is_err() {
+        terminate_process_tree(&mut child);
+        return Err(ToolError::ActionOutcomeUnknown);
+    }
+    let mut stdout_bytes = Vec::with_capacity(MAX_COMMAND_OUTPUT);
+    let mut stderr_bytes = Vec::with_capacity(MAX_COMMAND_OUTPUT);
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
     let started = Instant::now();
+    let mut exited_at = None;
     let status = loop {
-        if cancelled.load(Ordering::Acquire) || started.elapsed() >= COMMAND_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+        if cancelled.load(Ordering::Acquire) {
+            terminate_process_tree(&mut child);
             return Err(ToolError::ActionCancelled);
         }
-        if let Some(status) = child.try_wait().map_err(|_| ToolError::ReadFailed)? {
+        if started.elapsed() >= COMMAND_TIMEOUT {
+            terminate_process_tree(&mut child);
+            return Err(ToolError::ActionTimedOut);
+        }
+        if read_capped(
+            &mut stdout,
+            &mut stdout_bytes,
+            &mut stdout_truncated,
+            MAX_COMMAND_OUTPUT,
+            &mut stdout_eof,
+        )
+        .is_err()
+            || read_capped(
+                &mut stderr,
+                &mut stderr_bytes,
+                &mut stderr_truncated,
+                MAX_COMMAND_OUTPUT,
+                &mut stderr_eof,
+            )
+            .is_err()
+        {
+            terminate_process_tree(&mut child);
+            return Err(ToolError::ActionOutcomeUnknown);
+        }
+        if exited_at.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // A command may leave descendants holding our pipes. They
+                    // belong to its process group and must not outlive the action.
+                    terminate_process_group(child.id());
+                    exited_at = Some((Instant::now(), status));
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    terminate_process_tree(&mut child);
+                    return Err(ToolError::ActionOutcomeUnknown);
+                }
+            }
+        }
+        if let Some((exit_time, status)) = exited_at
+            && ((stdout_eof && stderr_eof) || exit_time.elapsed() >= Duration::from_millis(250))
+        {
             break status;
         }
         thread::sleep(Duration::from_millis(25));
     };
-    let (stdout, stdout_truncated) = stdout_reader.join().map_err(|_| ToolError::ReadFailed)??;
-    let (stderr, stderr_truncated) = stderr_reader.join().map_err(|_| ToolError::ReadFailed)??;
     let mut output = format!(
         "exit code: {}\nstdout:\n{}\nstderr:\n{}{}",
         status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&stdout),
-        String::from_utf8_lossy(&stderr),
+        String::from_utf8_lossy(&stdout_bytes),
+        String::from_utf8_lossy(&stderr_bytes),
         if stdout_truncated || stderr_truncated {
             "\noutput truncated"
         } else {
@@ -235,23 +292,74 @@ fn run_command(
     Ok(output)
 }
 
-fn read_capped(mut reader: impl Read, limit: usize) -> Result<(Vec<u8>, bool), ToolError> {
-    let mut output = Vec::with_capacity(limit.min(4096));
+fn terminate_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    terminate_process_group(child.id());
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn terminate_process_group(process_id: u32) {
+    use nix::{
+        sys::signal::{Signal, killpg},
+        unistd::Pid,
+    };
+    let group = Pid::from_raw(process_id as i32);
+    if killpg(group, None).is_err() {
+        return;
+    }
+    let _ = killpg(group, Signal::SIGTERM);
+    let deadline = Instant::now() + Duration::from_millis(150);
+    while Instant::now() < deadline && killpg(group, None).is_ok() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = killpg(group, Signal::SIGKILL);
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_process_id: u32) {}
+
+fn read_capped(
+    reader: &mut impl Read,
+    output: &mut Vec<u8>,
+    truncated: &mut bool,
+    limit: usize,
+    eof: &mut bool,
+) -> io::Result<()> {
     let mut buffer = [0u8; 4096];
-    let mut truncated = false;
+    let mut drained = 0usize;
     loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|_| ToolError::ReadFailed)?;
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if count == 0 {
-            break;
+            *eof = true;
+            return Ok(());
         }
+        drained += count;
         let remaining = limit.saturating_sub(output.len());
         let kept = count.min(remaining);
         output.extend_from_slice(&buffer[..kept]);
-        truncated |= kept < count;
+        *truncated |= kept < count;
+        if drained >= 64 * 1024 {
+            return Ok(());
+        }
     }
-    Ok((output, truncated))
+}
+
+#[cfg(unix)]
+fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> nix::Result<()> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    let fd = pipe.as_raw_fd();
+    let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map(|_| ())
 }
 
 #[derive(Deserialize)]
@@ -543,5 +651,40 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(path).unwrap(), "changed after approval");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_command_stops_its_process_group_without_affecting_unrelated_processes() {
+        use std::{
+            process::Command,
+            sync::{Arc, atomic::AtomicBool},
+            thread,
+            time::{Duration, Instant},
+        };
+        let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let request = ToolRequest::from_event(&serde_json::json!({
+            "call_id":"30000000-0000-4000-8000-000000000003",
+            "name":"run_command",
+            "arguments":{"cwd":".","argv":["sh","-c","sleep 30 & wait"]}
+        }))
+        .unwrap();
+        let preimage = prepare_action_at(&request, &root).unwrap();
+        let mut unrelated = Command::new("sleep").arg("2").spawn().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = cancellation.clone();
+        let action = std::thread::spawn(move || {
+            execute_approved_action_at(&request, &preimage, &worker_cancellation, &root)
+        });
+        thread::sleep(Duration::from_millis(150));
+        let started = Instant::now();
+        cancellation.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(action.join().unwrap(), Err(ToolError::ActionCancelled));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "unrelated child was terminated"
+        );
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
     }
 }

@@ -24,6 +24,9 @@ keyring = { version = "=3.6.3", features = ["sync-secret-service", "crypto-rust"
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "=3.6.3", features = ["apple-native"] }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "=0.29.0", features = ["fs", "process", "signal"] }
+
 [[bin]]
 name = "cortex"
 path = "src/main.rs"

@@ -304,6 +304,7 @@ dependencies = [
  "crossterm",
  "fernet",
  "keyring",
+ "nix",
  "rand 0.9.5",
  "reqwest",
  "serde",

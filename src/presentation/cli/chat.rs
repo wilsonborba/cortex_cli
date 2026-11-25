@@ -39,7 +39,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -126,6 +126,90 @@ struct TurnControl {
     active: bool,
     stop_requested: bool,
     cancel_pending: bool,
+}
+
+struct ActionWorker {
+    cancel: Option<Arc<AtomicBool>>,
+    result: Option<mpsc::Receiver<Result<String, crate::domain::services::tools::ToolError>>>,
+    thread: Option<JoinHandle<()>>,
+    retry_at: Instant,
+    cancel_command: Option<u64>,
+}
+
+impl Default for ActionWorker {
+    fn default() -> Self {
+        Self {
+            cancel: None,
+            result: None,
+            thread: None,
+            retry_at: Instant::now(),
+            cancel_command: None,
+        }
+    }
+}
+
+impl ActionWorker {
+    fn start(
+        &mut self,
+        request: crate::domain::models::tools::ToolRequest,
+        preimage: crate::domain::services::tools::ActionPreimage,
+    ) {
+        self.cancel();
+        self.join();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = crate::domain::services::tools::execute_approved_action(
+                &request,
+                &preimage,
+                &worker_cancel,
+            );
+            let _ = sender.send(result);
+        });
+        self.cancel = Some(cancel);
+        self.result = Some(receiver);
+        self.thread = Some(handle);
+        self.retry_at = Instant::now();
+    }
+
+    fn cancel(&self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
+    fn take_result(&mut self) -> Option<Result<String, crate::domain::services::tools::ToolError>> {
+        let receiver = self.result.as_ref()?;
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.result = None;
+                self.join();
+                self.cancel = None;
+                Some(result)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.result = None;
+                self.join();
+                self.cancel = None;
+                Some(Err(crate::domain::services::tools::ToolError::ReadFailed))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        }
+    }
+
+    fn join(&mut self) {
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ActionWorker {
+    fn drop(&mut self) {
+        self.cancel();
+        self.join();
+    }
 }
 
 struct RemoteCommandQueue {
@@ -498,20 +582,21 @@ fn answer_pending_action(
     state: &mut ChatState,
     remote_session: &str,
     approved: bool,
+    worker: &mut ActionWorker,
 ) -> Result<(), ChatFailure> {
     let pending = state
         .pending_action
         .as_ref()
         .cloned()
         .ok_or(ChatFailure::InvalidResponse)?;
-    let (chat, output) = match (state.chat_id.as_deref(), state.output_id.as_deref()) {
+    let (chat, output) = match (state.chat_id.clone(), state.output_id.clone()) {
         (Some(chat), Some(output)) => (chat, output),
         _ => return Err(ChatFailure::InvalidResponse),
     };
     if let Some(result) = pending.completed_result {
         api.submit_tool_result(
-            chat,
-            output,
+            &chat,
+            &output,
             &ToolResult {
                 call_id: pending.request.call_id,
                 name: pending.request.name,
@@ -522,7 +607,7 @@ fn answer_pending_action(
         return Ok(());
     }
     let current =
-        api.get_output_action(remote_session, chat, output, &pending.receipt.action_id)?;
+        api.get_output_action(remote_session, &chat, &output, &pending.receipt.action_id)?;
     if !current.matches(&pending.request) {
         return Err(ChatFailure::InvalidResponse);
     }
@@ -531,8 +616,8 @@ fn answer_pending_action(
     let answered = if current.status == "pending" {
         api.answer_output_action(
             remote_session,
-            chat,
-            output,
+            &chat,
+            &output,
             &pending.receipt.action_id,
             effective_approval,
         )?
@@ -552,39 +637,121 @@ fn answer_pending_action(
     let output_text = if effective_approval {
         let claimed = api.claim_output_action(
             remote_session,
-            chat,
-            output,
+            &chat,
+            &output,
             &pending.receipt.action_id,
             &pending.request,
         )?;
         if !claimed.matches(&pending.request) || claimed.status != "claimed" {
             return Err(ChatFailure::InvalidResponse);
         }
-        crate::domain::services::tools::execute_approved_action(
-            &pending.request,
-            &pending.preimage,
-            &AtomicBool::new(false),
-        )
-        .unwrap_or_else(|error| format!("Not executed: {error}"))
+        worker.start(pending.request.clone(), pending.preimage.clone());
+        return Ok(());
     } else {
         "Not executed: approval was denied.".into()
     };
-    if let Some(action) = state.pending_action.as_mut() {
-        action.completed_result = Some(output_text.clone());
-    } else {
-        return Err(ChatFailure::InvalidResponse);
-    }
+    let action = state
+        .pending_action
+        .as_mut()
+        .ok_or(ChatFailure::InvalidResponse)?;
+    action.completed_result = Some(output_text);
+    submit_completed_action_result(api, state, &chat, &output, worker)
+}
+
+fn submit_completed_action_result(
+    api: &impl ChatApi,
+    state: &mut ChatState,
+    chat: &str,
+    output: &str,
+    worker: &mut ActionWorker,
+) -> Result<(), ChatFailure> {
+    let pending = state
+        .pending_action
+        .as_ref()
+        .ok_or(ChatFailure::InvalidResponse)?;
+    let result = pending
+        .completed_result
+        .as_ref()
+        .ok_or(ChatFailure::InvalidResponse)?;
     api.submit_tool_result(
         chat,
         output,
         &ToolResult {
-            call_id: pending.request.call_id,
+            call_id: pending.request.call_id.clone(),
             name: pending.request.name,
-            output: output_text,
+            output: result.clone(),
         },
     )?;
     state.pending_action = None;
+    worker.retry_at = Instant::now();
     Ok(())
+}
+
+fn poll_action_worker(
+    api: &impl ChatApi,
+    state: &mut ChatState,
+    worker: &mut ActionWorker,
+    publisher: Option<&RemotePublisher>,
+) {
+    if state.pending_action.is_none() {
+        return;
+    }
+    if let Some(result) = worker.take_result() {
+        match result {
+            Ok(result) => {
+                if let Some(action) = state.pending_action.as_mut() {
+                    action.completed_result = Some(result);
+                }
+            }
+            Err(crate::domain::services::tools::ToolError::ActionCancelled) => {
+                if let (Some(command_id), Some(publisher)) =
+                    (worker.cancel_command.take(), publisher)
+                {
+                    publisher.publish(
+                        RemoteEventKind::Progress,
+                        json!({"status":"cancelled","command_id":command_id}),
+                    );
+                }
+                state.pending_action = None;
+                return;
+            }
+            Err(crate::domain::services::tools::ToolError::ActionTimedOut) => {
+                if let Some(action) = state.pending_action.as_mut() {
+                    action.completed_result = Some(
+                        "Command was stopped at its time limit; it may have partial side effects. It will not be rerun automatically.".into(),
+                    );
+                }
+            }
+            Err(crate::domain::services::tools::ToolError::ActionOutcomeUnknown) => {
+                if let Some(action) = state.pending_action.as_mut() {
+                    action.completed_result = Some(
+                        "Command outcome is unknown. It was stopped and will not be rerun automatically.".into(),
+                    );
+                }
+            }
+            Err(error) => {
+                if let Some(action) = state.pending_action.as_mut() {
+                    action.completed_result = Some(format!("Not executed: {error}"));
+                }
+            }
+        }
+    }
+    if worker.result.is_some() || Instant::now() < worker.retry_at {
+        return;
+    }
+    let Some((chat, output)) = state.chat_id.clone().zip(state.output_id.clone()) else {
+        return;
+    };
+    if state
+        .pending_action
+        .as_ref()
+        .is_some_and(|action| action.completed_result.is_some())
+    {
+        match submit_completed_action_result(api, state, &chat, &output, worker) {
+            Ok(()) => {}
+            Err(_) => worker.retry_at = Instant::now() + Duration::from_secs(1),
+        }
+    }
 }
 
 fn effective_approval(status: &str, requested: bool) -> Option<bool> {
@@ -608,6 +775,7 @@ impl RemoteCommandQueue {
         remote: &RemoteSessionGuard,
         state: &mut ChatState,
         controls: &mut TurnControl,
+        worker: &mut ActionWorker,
         out: &mut impl Write,
         surface: &mut Surface,
     ) -> io::Result<()> {
@@ -642,12 +810,13 @@ impl RemoteCommandQueue {
                         if let (Some(chat), Some(output)) =
                             (state.chat_id.as_deref(), state.output_id.as_deref())
                         {
+                            worker.cancel();
                             match remote.api.cancel(chat, output) {
                                 Ok(()) => {
                                     controls.stop_requested = true;
-                                    state.pending_action = None;
+                                    worker.cancel_command = Some(event.id);
                                     surface.text(out, "\nCancellation requested from phone.\n")?;
-                                    "cancelled"
+                                    "cancel_requested"
                                 }
                                 Err(_) => "cancel_failed",
                             }
@@ -671,6 +840,7 @@ impl RemoteCommandQueue {
                                 state,
                                 &remote.session_id,
                                 approved,
+                                worker,
                             ) {
                                 Ok(()) => "approval_received",
                                 Err(_) => "approval_failed",
@@ -836,6 +1006,7 @@ fn interactive<G: ChatApi + 'static>(
     let mut cleaner = TerminalText::default();
     let mut controls = TurnControl::default();
     let mut remote_commands = RemoteCommandQueue::default();
+    let mut action_worker = ActionWorker::default();
     let mut remote_online = true;
     let mut remote_delivery_reported = false;
     let mut dirty = true;
@@ -899,13 +1070,26 @@ fn interactive<G: ChatApi + 'static>(
                 dirty = true;
             }
             controls.active = receiver.is_some();
-            remote_commands.poll(remote, &mut state, &mut controls, out, &mut surface)?;
+            remote_commands.poll(
+                remote,
+                &mut state,
+                &mut controls,
+                &mut action_worker,
+                out,
+                &mut surface,
+            )?;
             if remote.publisher.failed.load(Ordering::Relaxed) && !remote_delivery_reported {
                 remote_delivery_reported = true;
                 surface.text(out, "\nPhone updates stopped after a connection error.\n")?;
                 dirty = true;
             }
         }
+        poll_action_worker(
+            api.as_ref(),
+            &mut state,
+            &mut action_worker,
+            remote.as_ref().map(|remote| &remote.publisher),
+        );
         if let Some(rx) = receiver.as_ref() {
             let mut finished = false;
             loop {
@@ -1047,9 +1231,9 @@ fn interactive<G: ChatApi + 'static>(
                             (state.chat_id.as_deref(), state.output_id.as_deref())
                         {
                             if !controls.stop_requested {
+                                action_worker.cancel();
                                 api.cancel(chat, output).map_err(failure)?;
                                 controls.stop_requested = true;
-                                state.pending_action = None;
                                 surface.text(out, "\nCancellation requested.\n")?;
                             }
                         } else {
@@ -1080,17 +1264,28 @@ fn interactive<G: ChatApi + 'static>(
                         &mut state,
                         &remote.session_id,
                         approved,
+                        &mut action_worker,
                     ) {
                         Ok(()) => surface.text(
                             out,
                             if approved {
-                                "\nApproved action claimed and returned to Cortex.\n"
+                                "\nApproval accepted; action is running.\n"
                             } else {
-                                "\nAction denied and returned to Cortex.\n"
+                                "\nAction denied; returning its result to Cortex.\n"
                             },
                         )?,
                         Err(error) => {
-                            surface.text(out, &format!("\nAction was not executed: {error}\n"))?
+                            surface.text(
+                                out,
+                                &format!(
+                                    "\n{}: {error}\n",
+                                    if state.pending_action.as_ref().is_some_and(|action| action.completed_result.is_some()) {
+                                        "Action result delivery is pending; the action will not run again"
+                                    } else {
+                                        "Approval or claim was not confirmed; this client will not retry execution automatically"
+                                    }
+                                ),
+                            )?
                         }
                     }
                     continue;
@@ -1248,6 +1443,226 @@ mod tests {
         assert_eq!(effective_approval("cancelled", true), None);
         assert_eq!(effective_approval("expired", true), None);
         assert_eq!(effective_approval("claimed", false), None);
+    }
+
+    #[test]
+    fn completed_action_result_retries_delivery_without_rerunning_effect() {
+        use crate::domain::models::{chat::ChatPage, tools::OutputActionReceipt};
+        use std::sync::atomic::AtomicUsize;
+
+        struct RetryApi {
+            request: crate::domain::models::tools::ToolRequest,
+            submissions: AtomicUsize,
+            outputs: std::sync::Mutex<Vec<String>>,
+            claim_response_lost: bool,
+            claim_is_ambiguous: AtomicBool,
+        }
+        impl RetryApi {
+            fn receipt(&self, status: &str) -> OutputActionReceipt {
+                let request = &self.request;
+                OutputActionReceipt {
+                    action_id: "30000000-0000-4000-8000-000000000003".into(),
+                    call_id: request.call_id.clone(),
+                    name: request.name.as_str().into(),
+                    action_kind: "command".into(),
+                    action_digest: request.action_digest(),
+                    display: "fixture command".into(),
+                    expires_at: "later".into(),
+                    status: status.into(),
+                }
+            }
+        }
+        impl ChatApi for RetryApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn submit_tool_result(
+                &self,
+                _: &str,
+                _: &str,
+                result: &ToolResult,
+            ) -> Result<(), ChatFailure> {
+                self.outputs.lock().unwrap().push(result.output.clone());
+                if self.submissions.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(ChatFailure::Connection)
+                } else {
+                    Ok(())
+                }
+            }
+            fn get_output_action(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<OutputActionReceipt, ChatFailure> {
+                Ok(
+                    self.receipt(if self.claim_is_ambiguous.load(Ordering::SeqCst) {
+                        "claimed"
+                    } else {
+                        "pending"
+                    }),
+                )
+            }
+            fn answer_output_action(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+                approved: bool,
+            ) -> Result<OutputActionReceipt, ChatFailure> {
+                Ok(self.receipt(if approved { "approved" } else { "denied" }))
+            }
+            fn claim_output_action(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &crate::domain::models::tools::ToolRequest,
+            ) -> Result<OutputActionReceipt, ChatFailure> {
+                if self.claim_response_lost {
+                    self.claim_is_ambiguous.store(true, Ordering::SeqCst);
+                    Err(ChatFailure::Connection)
+                } else {
+                    Ok(self.receipt("claimed"))
+                }
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(&self, _: &str) -> Result<ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+        }
+
+        let request = crate::domain::models::tools::ToolRequest::from_event(&json!({
+                "call_id":"10000000-0000-4000-8000-000000000001",
+                "name":"run_command",
+                "arguments":{"cwd":".","argv":["sh","-c","sleep 0.3; printf x >> .cache_retry_action_fixture"]}
+            })).unwrap();
+        let marker = std::path::Path::new(".cache_retry_action_fixture");
+        let _ = std::fs::remove_file(marker);
+        std::fs::write(marker, "").unwrap();
+        let preimage = crate::domain::services::tools::prepare_action(&request).unwrap();
+        let api = RetryApi {
+            request: request.clone(),
+            submissions: AtomicUsize::new(0),
+            outputs: std::sync::Mutex::new(Vec::new()),
+            claim_response_lost: false,
+            claim_is_ambiguous: AtomicBool::new(false),
+        };
+        let mut state = ChatState {
+            chat_id: Some("10000000-0000-4000-8000-000000000001".into()),
+            output_id: Some("20000000-0000-4000-8000-000000000002".into()),
+            pending_action: Some(crate::domain::services::chat::PendingOutputAction {
+                request: request.clone(),
+                receipt: api.receipt("pending"),
+                preimage,
+                completed_result: None,
+            }),
+            ..Default::default()
+        };
+        let mut worker = ActionWorker::default();
+        let started = Instant::now();
+        answer_pending_action(
+            &api,
+            &mut state,
+            "40000000-0000-4000-8000-000000000004",
+            true,
+            &mut worker,
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "approval handling must not wait for the effect"
+        );
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while state.pending_action.is_some() && Instant::now() < deadline {
+            poll_action_worker(&api, &mut state, &mut worker, None);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            state.pending_action.is_none(),
+            "result delivery should retry after the first failure"
+        );
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+        let outputs = api.outputs.lock().unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], outputs[1]);
+        drop(outputs);
+        std::fs::remove_file(marker).unwrap();
+
+        let ambiguous_marker = std::path::Path::new(".cache_ambiguous_claim_fixture");
+        let _ = std::fs::remove_file(ambiguous_marker);
+        let ambiguous_request = crate::domain::models::tools::ToolRequest::from_event(&json!({
+            "call_id":"50000000-0000-4000-8000-000000000005",
+            "name":"run_command",
+            "arguments":{"cwd":".","argv":["sh","-c","printf x > .cache_ambiguous_claim_fixture"]}
+        }))
+        .unwrap();
+        let ambiguous_api = RetryApi {
+            request: ambiguous_request.clone(),
+            submissions: AtomicUsize::new(0),
+            outputs: std::sync::Mutex::new(Vec::new()),
+            claim_response_lost: true,
+            claim_is_ambiguous: AtomicBool::new(false),
+        };
+        let ambiguous_preimage =
+            crate::domain::services::tools::prepare_action(&ambiguous_request).unwrap();
+        let mut ambiguous_state = ChatState {
+            chat_id: Some("10000000-0000-4000-8000-000000000001".into()),
+            output_id: Some("20000000-0000-4000-8000-000000000002".into()),
+            pending_action: Some(crate::domain::services::chat::PendingOutputAction {
+                request: ambiguous_request,
+                receipt: ambiguous_api.receipt("pending"),
+                preimage: ambiguous_preimage,
+                completed_result: None,
+            }),
+            ..Default::default()
+        };
+        let mut ambiguous_worker = ActionWorker::default();
+        assert!(
+            answer_pending_action(
+                &ambiguous_api,
+                &mut ambiguous_state,
+                "40000000-0000-4000-8000-000000000004",
+                true,
+                &mut ambiguous_worker
+            )
+            .is_err()
+        );
+        assert!(
+            ambiguous_worker.result.is_none(),
+            "lost claim response must not start execution"
+        );
+        assert!(
+            answer_pending_action(
+                &ambiguous_api,
+                &mut ambiguous_state,
+                "40000000-0000-4000-8000-000000000004",
+                true,
+                &mut ambiguous_worker
+            )
+            .is_err()
+        );
+        assert!(
+            ambiguous_worker.result.is_none(),
+            "a claimed action remains fail-closed after reconnect"
+        );
+        assert!(!ambiguous_marker.exists());
     }
 
     struct Fixture;
