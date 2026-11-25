@@ -16,6 +16,9 @@
 - Use accepted output identity for cancellation and reconnect
 - Merge inline terminal chat
 - Add external provider API key support
+- Integrate reviewed external provider adapters
+- Add explicit consent-gated CLI usage tracking
+- Integrate explicit consent and fixed usage payloads
 
 
 ### Fixes
@@ -23,6 +26,7 @@
 - Keep narrow terminal activity details readable
 - Correlate streamed results with the selected conversation
 - Keep terminal title readable on light backgrounds
+- Bound and sanitize provider responses
 
 
 ### Maintenance
