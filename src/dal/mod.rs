@@ -5,6 +5,7 @@
 
 pub mod local {
     pub mod session;
+    pub mod telemetry_consent;
 }
 pub mod remote {
     pub mod chat;
