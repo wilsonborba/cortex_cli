@@ -12,7 +12,7 @@ use crate::domain::{
         chat::{ChatFailure, ChatPage, ChatSummary, valid_id},
         native_auth::Session,
         remote_control::{RemoteEvent, RemoteEventKind, RemoteSession},
-        tools::{MAX_TOOL_RESULT_BYTES, ToolResult},
+        tools::{MAX_TOOL_RESULT_BYTES, OutputActionReceipt, ToolRequest, ToolResult},
     },
     services::chat::ChatApi,
 };
@@ -106,6 +106,11 @@ impl CortexClient {
             .send()
             .map_err(|_| ChatFailure::Connection)?;
         Self::json(Self::checked(response)?)
+    }
+
+    fn output_action(response: Response) -> Result<OutputActionReceipt, ChatFailure> {
+        let value = Self::json(Self::checked(response)?)?;
+        serde_json::from_value(value["data"].clone()).map_err(|_| ChatFailure::InvalidResponse)
     }
 
     pub fn register_remote_session(&self) -> Result<RemoteSession, ChatFailure> {
@@ -336,6 +341,124 @@ impl ChatApi for CortexClient {
         Ok(())
     }
 
+    fn create_output_action(
+        &self,
+        remote_session: &str,
+        chat: &str,
+        output: &str,
+        request: &ToolRequest,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        if !valid_id(remote_session)
+            || !valid_id(chat)
+            || !valid_id(output)
+            || !valid_id(&request.call_id)
+        {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let response = self
+            .authenticated(
+                self.client
+                    .post(format!(
+                        "{}/remote/sessions/{remote_session}/outputs/{chat}/{output}/actions",
+                        self.base
+                    ))
+                    .timeout(Duration::from_secs(20))
+                    .json(&json!({"call_id":request.call_id})),
+                true,
+            )
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let action = Self::output_action(response)?;
+        if !action.matches(request) || action.status != "pending" {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        Ok(action)
+    }
+
+    fn get_output_action(
+        &self,
+        remote_session: &str,
+        chat: &str,
+        output: &str,
+        action_id: &str,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        if !valid_id(remote_session) || !valid_id(chat) || !valid_id(output) || !valid_id(action_id)
+        {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let value = self.get(&format!(
+            "/remote/sessions/{remote_session}/outputs/{chat}/{output}/actions/{action_id}"
+        ))?;
+        serde_json::from_value(value["data"].clone()).map_err(|_| ChatFailure::InvalidResponse)
+    }
+
+    fn answer_output_action(
+        &self,
+        remote_session: &str,
+        chat: &str,
+        output: &str,
+        action_id: &str,
+        approved: bool,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        if !valid_id(remote_session) || !valid_id(chat) || !valid_id(output) || !valid_id(action_id)
+        {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let response = self
+            .authenticated(
+                self.client
+                    .post(format!(
+                        "{}/remote/sessions/{remote_session}/outputs/{chat}/{output}/actions/{action_id}/answer",
+                        self.base
+                    ))
+                    .timeout(Duration::from_secs(20))
+                    .json(&json!({"approved":approved})),
+                true,
+            )
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        Self::output_action(response)
+    }
+
+    fn claim_output_action(
+        &self,
+        remote_session: &str,
+        chat: &str,
+        output: &str,
+        action_id: &str,
+        request: &ToolRequest,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        if !valid_id(remote_session)
+            || !valid_id(chat)
+            || !valid_id(output)
+            || !valid_id(action_id)
+            || !valid_id(&request.call_id)
+        {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let response = self
+            .authenticated(
+                self.client
+                    .post(format!(
+                        "{}/remote/sessions/{remote_session}/outputs/{chat}/{output}/actions/{action_id}/claim",
+                        self.base
+                    ))
+                    .timeout(Duration::from_secs(20))
+                    .json(&json!({
+                        "call_id":request.call_id,
+                        "action_digest":request.action_digest()
+                    })),
+                true,
+            )
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let action = Self::output_action(response)?;
+        if !action.matches(request) || action.status != "claimed" {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        Ok(action)
+    }
+
     fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
         let value = self.get("/chats")?;
         let rows: Vec<ChatSummary> = serde_json::from_value(value["data"].clone())
@@ -526,6 +649,46 @@ mod tests {
                 "result":{"output":"1: example"}
             })
         );
+    }
+
+    #[test]
+    fn output_action_registration_sends_only_the_call_id_and_checks_server_binding() {
+        let request = ToolRequest::from_event(&json!({
+            "call_id":"30000000-0000-4000-8000-000000000003",
+            "name":"run_command",
+            "arguments":{"cwd":".","argv":["echo","ok"]}
+        }))
+        .unwrap();
+        let action_id = "40000000-0000-4000-8000-000000000004";
+        let digest = request.action_digest();
+        let display = "cwd: .\ncommand: [\"echo\",\"ok\"]";
+        let body = json!({"data":{
+            "action_id":action_id,
+            "call_id":&request.call_id,
+            "name":"run_command",
+            "action_kind":"command",
+            "action_digest":digest,
+            "display":display,
+            "expires_at":"2026-11-25T04:00:00Z",
+            "status":"pending"
+        }})
+        .to_string();
+        let (client, worker) = server(201, "application/json", body);
+        let action = client
+            .create_output_action(
+                "50000000-0000-4000-8000-000000000005",
+                CHAT,
+                OUTPUT,
+                &request,
+            )
+            .unwrap();
+        assert_eq!(action.action_id, action_id);
+        let raw = worker.join().unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with(&format!("POST /apps/cortex/v1/remote/sessions/50000000-0000-4000-8000-000000000005/outputs/{CHAT}/{OUTPUT}/actions HTTP/1.1")));
+        assert!(head.to_lowercase().contains("x-csrf-token:"));
+        let payload: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload, json!({"call_id":request.call_id}));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::chat::{ChatFailure, valid_id};
 
@@ -40,6 +41,36 @@ pub struct ToolResult {
     pub call_id: String,
     pub name: ToolName,
     pub output: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutputActionReceipt {
+    pub action_id: String,
+    pub call_id: String,
+    pub name: String,
+    pub action_kind: String,
+    pub action_digest: String,
+    pub display: String,
+    pub expires_at: String,
+    pub status: String,
+}
+
+impl OutputActionReceipt {
+    pub fn matches(&self, request: &ToolRequest) -> bool {
+        let expected_kind = match request.name {
+            ToolName::ReplaceFileContent => "file_change",
+            ToolName::RunCommand => "command",
+            _ => return false,
+        };
+        valid_id(&self.action_id)
+            && self.call_id == request.call_id
+            && self.name == request.name.as_str()
+            && self.action_kind == expected_kind
+            && self.action_digest == request.action_digest()
+            && self.display.len() <= 64_000
+            && !self.expires_at.is_empty()
+    }
 }
 
 #[derive(Deserialize)]
@@ -86,6 +117,20 @@ fn bounded(value: &str, max: usize) -> bool {
 }
 
 impl ToolRequest {
+    pub fn action_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.call_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.name.as_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(self.arguments.to_string().as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     pub fn from_event(data: &Value) -> Result<Self, ChatFailure> {
         let object = data.as_object().ok_or(ChatFailure::InvalidResponse)?;
         if object.len() != 3 {
@@ -158,6 +203,7 @@ impl ToolRequest {
                     .map_err(|_| ChatFailure::InvalidResponse)?;
                 if !bounded(&args.cwd, 1024)
                     || args.argv.is_empty()
+                    || args.argv[0].trim().is_empty()
                     || args.argv.len() > 64
                     || args
                         .argv

@@ -1,7 +1,12 @@
 use std::{
     collections::VecDeque,
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::domain::models::tools::{
@@ -19,6 +24,7 @@ pub enum ToolError {
     InvalidPath,
     ReadFailed,
     ResultTooLarge,
+    ActionCancelled,
 }
 
 impl std::fmt::Display for ToolError {
@@ -28,8 +34,224 @@ impl std::fmt::Display for ToolError {
             Self::InvalidPath => "The requested path is outside the current workspace.",
             Self::ReadFailed => "The requested workspace content could not be read.",
             Self::ResultTooLarge => "The tool result exceeded the supported size.",
+            Self::ActionCancelled => "The approved action was cancelled before completion.",
         })
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionPreimage {
+    File { path: PathBuf, digest: String },
+    Command { cwd: PathBuf },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaceActionArgs {
+    path: String,
+    find: String,
+    replace: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandActionArgs {
+    cwd: String,
+    argv: Vec<String>,
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn prepare_action(request: &ToolRequest) -> Result<ActionPreimage, ToolError> {
+    let root = std::env::current_dir()
+        .and_then(|path| path.canonicalize())
+        .map_err(|_| ToolError::InvalidWorkspace)?;
+    prepare_action_at(request, &root)
+}
+
+fn prepare_action_at(request: &ToolRequest, root: &Path) -> Result<ActionPreimage, ToolError> {
+    match request.name {
+        ToolName::ReplaceFileContent => {
+            let args: ReplaceActionArgs = serde_json::from_value(request.arguments.clone())
+                .map_err(|_| ToolError::ReadFailed)?;
+            let path = resolve(root, &args.path)?;
+            if fs::metadata(&path)
+                .map_err(|_| ToolError::ReadFailed)?
+                .len()
+                > 1024 * 1024
+            {
+                return Err(ToolError::ResultTooLarge);
+            }
+            let content = fs::read_to_string(&path).map_err(|_| ToolError::ReadFailed)?;
+            if args.find.is_empty() || content.matches(&args.find).count() != 1 {
+                return Err(ToolError::ReadFailed);
+            }
+            Ok(ActionPreimage::File {
+                path,
+                digest: digest_bytes(content.as_bytes()),
+            })
+        }
+        ToolName::RunCommand => {
+            let args: CommandActionArgs = serde_json::from_value(request.arguments.clone())
+                .map_err(|_| ToolError::ReadFailed)?;
+            if args.argv.is_empty() || args.argv[0].trim().is_empty() {
+                return Err(ToolError::ReadFailed);
+            }
+            let cwd = resolve(root, &args.cwd)?;
+            if !fs::metadata(&cwd)
+                .map_err(|_| ToolError::ReadFailed)?
+                .is_dir()
+            {
+                return Err(ToolError::InvalidPath);
+            }
+            Ok(ActionPreimage::Command { cwd })
+        }
+        _ => Err(ToolError::ReadFailed),
+    }
+}
+
+pub fn execute_approved_action(
+    request: &ToolRequest,
+    preimage: &ActionPreimage,
+    cancelled: &AtomicBool,
+) -> Result<String, ToolError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ToolError::ActionCancelled);
+    }
+    let root = std::env::current_dir()
+        .and_then(|path| path.canonicalize())
+        .map_err(|_| ToolError::InvalidWorkspace)?;
+    execute_approved_action_at(request, preimage, cancelled, &root)
+}
+
+fn execute_approved_action_at(
+    request: &ToolRequest,
+    preimage: &ActionPreimage,
+    cancelled: &AtomicBool,
+    root: &Path,
+) -> Result<String, ToolError> {
+    match (request.name, preimage) {
+        (ToolName::ReplaceFileContent, ActionPreimage::File { path, digest }) => {
+            let args: ReplaceActionArgs = serde_json::from_value(request.arguments.clone())
+                .map_err(|_| ToolError::ReadFailed)?;
+            if resolve(root, &args.path)? != *path {
+                return Err(ToolError::InvalidPath);
+            }
+            let content = fs::read_to_string(path).map_err(|_| ToolError::ReadFailed)?;
+            if digest_bytes(content.as_bytes()) != *digest
+                || content.matches(&args.find).count() != 1
+            {
+                return Err(ToolError::ReadFailed);
+            }
+            let changed = content.replacen(&args.find, &args.replace, 1);
+            if changed.len() > 1024 * 1024 {
+                return Err(ToolError::ResultTooLarge);
+            }
+            if cancelled.load(Ordering::Acquire) || resolve(root, &args.path)? != *path {
+                return Err(ToolError::ActionCancelled);
+            }
+            let current = fs::read_to_string(path).map_err(|_| ToolError::ReadFailed)?;
+            if digest_bytes(current.as_bytes()) != *digest {
+                return Err(ToolError::ReadFailed);
+            }
+            fs::write(path, changed).map_err(|_| ToolError::ReadFailed)?;
+            Ok("File change applied.".into())
+        }
+        (ToolName::RunCommand, ActionPreimage::Command { cwd }) => {
+            let args: CommandActionArgs = serde_json::from_value(request.arguments.clone())
+                .map_err(|_| ToolError::ReadFailed)?;
+            let current_cwd = resolve(root, &args.cwd)?;
+            if current_cwd != *cwd || !current_cwd.is_dir() {
+                return Err(ToolError::InvalidPath);
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(ToolError::ActionCancelled);
+            }
+            run_command(&args, cwd, cancelled)
+        }
+        _ => Err(ToolError::ReadFailed),
+    }
+}
+
+fn run_command(
+    args: &CommandActionArgs,
+    cwd: &Path,
+    cancelled: &AtomicBool,
+) -> Result<String, ToolError> {
+    const MAX_COMMAND_OUTPUT: usize = 16 * 1024;
+    const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+    let mut child = Command::new(&args.argv[0])
+        .args(&args.argv[1..])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| ToolError::ReadFailed)?;
+    let stdout = child.stdout.take().ok_or(ToolError::ReadFailed)?;
+    let stderr = child.stderr.take().ok_or(ToolError::ReadFailed)?;
+    let stdout_reader = thread::spawn(move || read_capped(stdout, MAX_COMMAND_OUTPUT));
+    let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_COMMAND_OUTPUT));
+    let started = Instant::now();
+    let status = loop {
+        if cancelled.load(Ordering::Acquire) || started.elapsed() >= COMMAND_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(ToolError::ActionCancelled);
+        }
+        if let Some(status) = child.try_wait().map_err(|_| ToolError::ReadFailed)? {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let (stdout, stdout_truncated) = stdout_reader.join().map_err(|_| ToolError::ReadFailed)??;
+    let (stderr, stderr_truncated) = stderr_reader.join().map_err(|_| ToolError::ReadFailed)??;
+    let mut output = format!(
+        "exit code: {}\nstdout:\n{}\nstderr:\n{}{}",
+        status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr),
+        if stdout_truncated || stderr_truncated {
+            "\noutput truncated"
+        } else {
+            ""
+        }
+    );
+    if output.len() > MAX_TOOL_RESULT_BYTES {
+        let mut end = MAX_TOOL_RESULT_BYTES;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
+    }
+    Ok(output)
+}
+
+fn read_capped(mut reader: impl Read, limit: usize) -> Result<(Vec<u8>, bool), ToolError> {
+    let mut output = Vec::with_capacity(limit.min(4096));
+    let mut buffer = [0u8; 4096];
+    let mut truncated = false;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|_| ToolError::ReadFailed)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(output.len());
+        let kept = count.min(remaining);
+        output.extend_from_slice(&buffer[..kept]);
+        truncated |= kept < count;
+    }
+    Ok((output, truncated))
 }
 
 #[derive(Deserialize)]
@@ -220,12 +442,16 @@ fn grep(root: &Path, args: &GrepArgs) -> Result<String, ToolError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolError, execute_readonly_at};
+    use super::{
+        ActionPreimage, ToolError, execute_approved_action_at, execute_readonly_at,
+        prepare_action_at,
+    };
     use crate::domain::models::tools::ToolRequest;
     use serde_json::json;
     use std::{
         fs,
         os::unix::fs::symlink,
+        sync::atomic::AtomicBool,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -289,6 +515,33 @@ mod tests {
             let result = execute_readonly_at(&request, &root).unwrap().unwrap();
             assert_eq!(result.lines().count(), 1);
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn approved_file_action_rechecks_the_preimage_before_writing() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cortex-cli-action-preimage-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.txt");
+        fs::write(&path, "before").unwrap();
+        let request = ToolRequest::from_event(&json!({
+            "call_id":"30000000-0000-4000-8000-000000000003",
+            "name":"replace_file_content",
+            "arguments":{"path":"note.txt","find":"before","replace":"after"}
+        }))
+        .unwrap();
+        let preimage = prepare_action_at(&request, &root).unwrap();
+        assert!(matches!(preimage, ActionPreimage::File { .. }));
+        fs::write(&path, "changed after approval").unwrap();
+        assert_eq!(
+            execute_approved_action_at(&request, &preimage, &AtomicBool::new(false), &root),
+            Err(ToolError::ReadFailed)
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), "changed after approval");
         fs::remove_dir_all(root).unwrap();
     }
 }

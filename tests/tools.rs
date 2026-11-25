@@ -96,3 +96,12 @@ fn view_file_rejects_zero_and_ranges_over_500_inclusive_lines() {
         &json!({"call_id":CALL,"name":"view_file","arguments":{"path":"Cargo.toml","start_line":1,"end_line":500}})
     ).is_ok());
 }
+
+#[test]
+fn action_digest_matches_the_api_canonical_request_digest() {
+    let call = request("run_command", json!({"cwd":".","argv":["echo","ok"]}));
+    assert_eq!(
+        call.action_digest(),
+        "52f61567c4934e6c0ea1da29e80bb22fe2f08756ad1fc28b81ddace856de9c33"
+    );
+}

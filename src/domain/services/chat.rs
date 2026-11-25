@@ -4,7 +4,7 @@ use crate::{
     dal::remote::sse::SseDecoder,
     domain::models::{
         chat::{ChatFailure, ChatPage, ChatSummary, StreamEvent, valid_id},
-        tools::{ToolRequest, ToolResult},
+        tools::{OutputActionReceipt, ToolRequest, ToolResult},
     },
 };
 use serde_json::Value;
@@ -40,6 +40,44 @@ pub trait ChatApi: Send + Sync {
     ) -> Result<(), ChatFailure> {
         Err(ChatFailure::InvalidResponse)
     }
+    fn create_output_action(
+        &self,
+        _remote_session: &str,
+        _chat: &str,
+        _output: &str,
+        _request: &ToolRequest,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn get_output_action(
+        &self,
+        _remote_session: &str,
+        _chat: &str,
+        _output: &str,
+        _action_id: &str,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn answer_output_action(
+        &self,
+        _remote_session: &str,
+        _chat: &str,
+        _output: &str,
+        _action_id: &str,
+        _approved: bool,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn claim_output_action(
+        &self,
+        _remote_session: &str,
+        _chat: &str,
+        _output: &str,
+        _action_id: &str,
+        _request: &ToolRequest,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
     fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure>;
     fn history(&self, id: &str) -> Result<ChatPage, ChatFailure>;
     fn reconnect(
@@ -49,6 +87,14 @@ pub trait ChatApi: Send + Sync {
         after: u64,
     ) -> Result<Box<dyn Read + Send>, ChatFailure>;
     fn cancel(&self, chat: &str, output: &str) -> Result<(), ChatFailure>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingOutputAction {
+    pub request: ToolRequest,
+    pub receipt: OutputActionReceipt,
+    pub preimage: crate::domain::services::tools::ActionPreimage,
+    pub answer: Option<bool>,
 }
 
 pub fn latest_chat(api: &impl ChatApi) -> Result<Option<String>, ChatFailure> {
@@ -111,6 +157,7 @@ pub struct ChatState {
     pub complete: bool,
     pub total_ms: Option<u64>,
     pub tool_request: Option<ToolRequest>,
+    pub pending_action: Option<PendingOutputAction>,
 }
 
 impl ChatState {

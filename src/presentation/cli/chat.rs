@@ -418,7 +418,11 @@ fn begin_turn<G: ChatApi + 'static>(
     receiver
 }
 
-fn submit_tool_call(api: &impl ChatApi, state: &mut ChatState) -> Result<(), ChatFailure> {
+fn submit_tool_call(
+    api: &impl ChatApi,
+    state: &mut ChatState,
+    remote_session: Option<&str>,
+) -> Result<(), ChatFailure> {
     let request = state
         .tool_request
         .take()
@@ -434,7 +438,40 @@ fn submit_tool_call(api: &impl ChatApi, state: &mut ChatState) -> Result<(), Cha
                 "Not executed: a real child runner is not available for this request.".into()
             }
             ToolName::ReplaceFileContent | ToolName::RunCommand => {
-                "Not executed: this action has no verified shared approval binding.".into()
+                if let Some(remote_session) = remote_session {
+                    let preimage = match crate::domain::services::tools::prepare_action(&request) {
+                        Ok(preimage) => preimage,
+                        Err(error) => {
+                            api.submit_tool_result(
+                                chat,
+                                output,
+                                &ToolResult {
+                                    call_id: request.call_id,
+                                    name: request.name,
+                                    output: format!("Not executed: {error}"),
+                                },
+                            )?;
+                            return Ok(());
+                        }
+                    };
+                    match api.create_output_action(remote_session, chat, output, &request) {
+                        Ok(receipt) if receipt.matches(&request) && receipt.status == "pending" => {
+                            state.pending_action =
+                                Some(crate::domain::services::chat::PendingOutputAction {
+                                    request,
+                                    receipt,
+                                    preimage,
+                                    answer: None,
+                                });
+                            return Ok(());
+                        }
+                        _ => {
+                            "Not executed: a verified output action could not be registered.".into()
+                        }
+                    }
+                } else {
+                    "Not executed: an active owner-bound session is required for approval.".into()
+                }
             }
             ToolName::ViewFile | ToolName::GrepSearch => {
                 return Err(ChatFailure::InvalidResponse);
@@ -456,6 +493,76 @@ fn submit_tool_call(api: &impl ChatApi, state: &mut ChatState) -> Result<(), Cha
     )
 }
 
+fn answer_pending_action(
+    api: &impl ChatApi,
+    state: &mut ChatState,
+    remote_session: &str,
+    approved: bool,
+) -> Result<(), ChatFailure> {
+    let pending = state
+        .pending_action
+        .as_ref()
+        .cloned()
+        .ok_or(ChatFailure::InvalidResponse)?;
+    let (chat, output) = match (state.chat_id.as_deref(), state.output_id.as_deref()) {
+        (Some(chat), Some(output)) => (chat, output),
+        _ => return Err(ChatFailure::InvalidResponse),
+    };
+    let current =
+        api.get_output_action(remote_session, chat, output, &pending.receipt.action_id)?;
+    if !current.matches(&pending.request) {
+        return Err(ChatFailure::InvalidResponse);
+    }
+    let answered = match current.status.as_str() {
+        "approved" if approved => current,
+        "denied" if !approved => current,
+        "pending" => api.answer_output_action(
+            remote_session,
+            chat,
+            output,
+            &pending.receipt.action_id,
+            approved,
+        )?,
+        _ => return Err(ChatFailure::InvalidResponse),
+    };
+    if !answered.matches(&pending.request)
+        || answered.status != if approved { "approved" } else { "denied" }
+    {
+        return Err(ChatFailure::InvalidResponse);
+    }
+    let output_text = if approved {
+        let claimed = api.claim_output_action(
+            remote_session,
+            chat,
+            output,
+            &pending.receipt.action_id,
+            &pending.request,
+        )?;
+        if !claimed.matches(&pending.request) || claimed.status != "claimed" {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        crate::domain::services::tools::execute_approved_action(
+            &pending.request,
+            &pending.preimage,
+            &AtomicBool::new(false),
+        )
+        .unwrap_or_else(|error| format!("Not executed: {error}"))
+    } else {
+        "Not executed: approval was denied.".into()
+    };
+    api.submit_tool_result(
+        chat,
+        output,
+        &ToolResult {
+            call_id: pending.request.call_id,
+            name: pending.request.name,
+            output: output_text,
+        },
+    )?;
+    state.pending_action = None;
+    Ok(())
+}
+
 impl RemoteCommandQueue {
     fn enqueue(&mut self, event: RemoteEvent, acknowledged_cursor: u64) {
         if event.id > acknowledged_cursor && self.seen.insert(event.id) {
@@ -466,7 +573,7 @@ impl RemoteCommandQueue {
     fn poll(
         &mut self,
         remote: &RemoteSessionGuard,
-        state: &ChatState,
+        state: &mut ChatState,
         controls: &mut TurnControl,
         out: &mut impl Write,
         surface: &mut Surface,
@@ -505,6 +612,7 @@ impl RemoteCommandQueue {
                             match remote.api.cancel(chat, output) {
                                 Ok(()) => {
                                     controls.stop_requested = true;
+                                    state.pending_action = None;
                                     surface.text(out, "\nCancellation requested from phone.\n")?;
                                     "cancelled"
                                 }
@@ -519,12 +627,24 @@ impl RemoteCommandQueue {
                     }
                 }
                 RemoteEventKind::ApprovalAnswer => {
-                    if event.payload["approved"].as_bool().is_some()
-                        && event.payload["approval_id"]
-                            .as_str()
-                            .is_some_and(|id| !id.trim().is_empty())
+                    let decision = event.payload["approved"].as_bool();
+                    let action_id = event.payload["approval_id"].as_str();
+                    if let (Some(approved), Some(action_id), Some(pending)) =
+                        (decision, action_id, state.pending_action.as_ref())
                     {
-                        "approval_received"
+                        if action_id == pending.receipt.action_id {
+                            match answer_pending_action(
+                                remote.api.as_ref(),
+                                state,
+                                &remote.session_id,
+                                approved,
+                            ) {
+                                Ok(()) => "approval_received",
+                                Err(_) => "approval_failed",
+                            }
+                        } else {
+                            "stale_approval_answer"
+                        }
                     } else {
                         "invalid_approval_answer"
                     }
@@ -741,7 +861,7 @@ fn interactive<G: ChatApi + 'static>(
                 dirty = true;
             }
             controls.active = receiver.is_some();
-            remote_commands.poll(remote, &state, &mut controls, out, &mut surface)?;
+            remote_commands.poll(remote, &mut state, &mut controls, out, &mut surface)?;
             if remote.publisher.failed.load(Ordering::Relaxed) && !remote_delivery_reported {
                 remote_delivery_reported = true;
                 surface.text(out, "\nPhone updates stopped after a connection error.\n")?;
@@ -787,12 +907,26 @@ fn interactive<G: ChatApi + 'static>(
                                 )?;
                             }
                             if event.name == "tool_call" {
-                                if let Err(error) = submit_tool_call(api.as_ref(), &mut state) {
+                                if let Err(error) = submit_tool_call(
+                                    api.as_ref(),
+                                    &mut state,
+                                    remote.as_ref().map(|session| session.session_id.as_str()),
+                                ) {
                                     surface.text(out, &format!("\n{error}\n"))?;
                                     finished = true;
                                     break;
                                 }
-                                surface.text(out, "\nTool result returned to Cortex.\n")?;
+                                if let Some(action) = state.pending_action.as_ref() {
+                                    surface.text(
+                                        out,
+                                        &format!(
+                                            "\nApproval requested for this action:\n{}\nPress Y to approve or N to deny.\n",
+                                            clean(&action.receipt.display)
+                                        ),
+                                    )?;
+                                } else {
+                                    surface.text(out, "\nTool result returned to Cortex.\n")?;
+                                }
                             }
                             if state.complete {
                                 chat = state.chat_id.clone();
@@ -877,6 +1011,7 @@ fn interactive<G: ChatApi + 'static>(
                             if !controls.stop_requested {
                                 api.cancel(chat, output).map_err(failure)?;
                                 controls.stop_requested = true;
+                                state.pending_action = None;
                                 surface.text(out, "\nCancellation requested.\n")?;
                             }
                         } else {
@@ -885,6 +1020,40 @@ fn interactive<G: ChatApi + 'static>(
                         }
                     } else {
                         editor.take();
+                    }
+                    continue;
+                }
+                if state.pending_action.is_some()
+                    && !control
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && matches!(key.code, KeyCode::Char('y' | 'Y' | 'n' | 'N'))
+                {
+                    let approved = matches!(key.code, KeyCode::Char('y' | 'Y'));
+                    let Some(remote) = remote.as_ref() else {
+                        surface.text(
+                            out,
+                            "\nApproval session unavailable; action not executed.\n",
+                        )?;
+                        state.pending_action = None;
+                        continue;
+                    };
+                    match answer_pending_action(
+                        api.as_ref(),
+                        &mut state,
+                        &remote.session_id,
+                        approved,
+                    ) {
+                        Ok(()) => surface.text(
+                            out,
+                            if approved {
+                                "\nApproved action claimed and returned to Cortex.\n"
+                            } else {
+                                "\nAction denied and returned to Cortex.\n"
+                            },
+                        )?,
+                        Err(error) => {
+                            surface.text(out, &format!("\nAction was not executed: {error}\n"))?
+                        }
                     }
                     continue;
                 }
