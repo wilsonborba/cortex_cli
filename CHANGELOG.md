@@ -10,6 +10,7 @@
 
 
 ### Features
+- Prepare versioned CLI archives and checksum-verified Linux/macOS installation
 - Add native Asodya sign-in and OS keyring storage
 - Merge native Asodya sign-in
 - Add Cortex chat streaming and inline activity view
@@ -22,6 +23,7 @@
 
 
 ### Fixes
+- Reject non-executable release entries and clean failed installer/package staging
 - Discard invalid successful handoffs before session storage
 - Keep narrow terminal activity details readable
 - Correlate streamed results with the selected conversation
