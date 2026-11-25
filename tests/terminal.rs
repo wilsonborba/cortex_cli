@@ -103,6 +103,21 @@ fn mapped_flags_reject_extra_or_private_arguments_without_echo() {
         parse(args(&["--remote-control"])),
         Ok(Command::Chat(_))
     ));
+    assert!(matches!(
+        parse(args(&["provider", "set", "openai"])),
+        Ok(Command::Provider(_))
+    ));
+    assert!(matches!(
+        parse(args(&[
+            "-p",
+            "hello",
+            "--provider",
+            "gemini",
+            "--model",
+            "gemini-pro"
+        ])),
+        Ok(Command::Chat(_))
+    ));
     for invalid in [
         vec!["-c", "--continue"],
         vec!["-r", "not-an-id"],
@@ -110,6 +125,18 @@ fn mapped_flags_reject_extra_or_private_arguments_without_echo() {
         vec!["-p"],
         vec!["-p", "hello", "--remote-control"],
         vec!["--remote", "--remote-control"],
+        vec!["provider", "set", "unknown"],
+        vec!["-p", "hello", "--provider", "openai"],
+        vec!["--provider", "openai", "--model", "sample"],
+        vec![
+            "-p",
+            "hello",
+            "--provider",
+            "openai",
+            "--model",
+            "sample",
+            "--continue",
+        ],
     ] {
         assert!(parse(args(&invalid)).is_err());
     }

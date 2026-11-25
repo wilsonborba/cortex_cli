@@ -11,7 +11,7 @@ use crate::{
         terminal_text::{TerminalText, clean},
     },
     dal::{
-        local::session::OsSessionStore,
+        local::{session::OsSessionStore, telemetry_consent::OsTelemetryConsentStore},
         remote::{chat::CortexClient, gateway::GatewayClient, login_context},
     },
     domain::{
@@ -25,6 +25,7 @@ use crate::{
             auth::AuthService,
             chat::{ChatApi, ChatState, follow, latest_chat, owned_history, running_output},
             remote_control::reconnect_delay,
+            telemetry::{Telemetry, TrackingApi, establish_consent},
             tools::execute_readonly,
         },
     },
@@ -480,6 +481,7 @@ fn spawn_turn<G: ChatApi + 'static>(
     prompt: String,
     file_ids: Vec<String>,
     publisher: Option<RemotePublisher>,
+    telemetry: Option<Arc<Telemetry>>,
     sender: mpsc::Sender<Result<StreamEvent, ChatFailure>>,
 ) {
     thread::spawn(move || {
@@ -526,6 +528,9 @@ fn spawn_turn<G: ChatApi + 'static>(
         {
             publisher.publish(RemoteEventKind::TurnEnd, json!({"status":"incomplete"}));
         }
+        if let Some(telemetry) = telemetry {
+            telemetry.chat_result(result);
+        }
         if let Err(error) = result {
             let _ = sender.send(Err(error));
         }
@@ -538,9 +543,10 @@ fn begin_turn<G: ChatApi + 'static>(
     prompt: String,
     file_ids: Vec<String>,
     publisher: Option<RemotePublisher>,
+    telemetry: Option<Arc<Telemetry>>,
 ) -> mpsc::Receiver<Result<StreamEvent, ChatFailure>> {
     let (sender, receiver) = mpsc::channel();
-    spawn_turn(api, chat_id, prompt, file_ids, publisher, sender);
+    spawn_turn(api, chat_id, prompt, file_ids, publisher, telemetry, sender);
     receiver
 }
 
@@ -975,7 +981,9 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
     if options.prompt.is_none() && (!io::stdin().is_terminal() || !io::stdout().is_terminal()) {
         return out.write_all(super::formatters::help().as_bytes());
     }
-    let api = Arc::new(CortexClient::new(session()?).map_err(failure)?);
+    let signed_in = session()?;
+    let telemetry = telemetry_for(&signed_in);
+    let api = Arc::new(CortexClient::new(signed_in).map_err(failure)?);
     let chat = if options.continue_latest {
         latest_chat(api.as_ref()).map_err(failure)?
     } else {
@@ -1006,7 +1014,7 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
         };
         let mut text = TerminalText::default();
         let stream = api.send(chat.as_deref(), &prompt).map_err(failure)?;
-        follow(api.as_ref(), stream, &mut state, |event| {
+        let result = follow(api.as_ref(), stream, &mut state, |event| {
             if event.name == "token" {
                 out.write_all(
                     text.push(event.data["text"].as_str().unwrap_or(""))
@@ -1016,18 +1024,68 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
                 out.flush().map_err(|_| ChatFailure::Connection)?;
             }
             Ok(())
-        })
-        .map_err(failure)?;
+        });
+        if let Some(telemetry) = telemetry {
+            telemetry.chat_result(result);
+        }
+        result.map_err(failure)?;
         return writeln!(out);
     }
     let remote_api = options.remote_control.then(|| api.clone());
-    interactive(api, chat, history, out, remote_api)
+    interactive(api, chat, history, telemetry, out, remote_api)
+}
+
+fn telemetry_for(session: &Arc<Session>) -> Option<Arc<Telemetry>> {
+    use sha2::Digest;
+
+    let api = Arc::new(GatewayClient::new(settings::GATEWAY_URL).ok()?);
+    let mut digest = sha2::Sha256::digest(session.session_id.as_bytes());
+    let fingerprint = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    digest.fill(0);
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    let record = establish_consent(
+        api.as_ref(),
+        &OsTelemetryConsentStore,
+        session,
+        &fingerprint,
+        interactive,
+        ask_telemetry_consent,
+    );
+    record.as_ref()?;
+    let tracking: Arc<dyn TrackingApi> = api;
+    Telemetry::new(tracking, session.clone()).map(Arc::new)
+}
+
+fn ask_telemetry_consent(version: &str) -> Option<bool> {
+    let mut output = io::stderr().lock();
+    writeln!(
+        output,
+        "\nCortex can send limited, optional usage telemetry (policy version {version}). This choice is separate from accepting legal documents."
+    )
+    .ok()?;
+    writeln!(output, "It includes chat request counts and success or failure categories. It never includes prompts, responses, reasoning, file contents, or credentials.").ok()?;
+    writeln!(output, "Read: https://asodya.com/privacy-policy").ok()?;
+    loop {
+        write!(output, "Allow this telemetry? [y/N] ").ok()?;
+        output.flush().ok()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).ok()?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Some(true),
+            "" | "n" | "no" => return Some(false),
+            _ => writeln!(output, "Enter yes or no.").ok()?,
+        }
+    }
 }
 
 fn interactive<G: ChatApi + 'static>(
     api: Arc<G>,
     mut chat: Option<String>,
     history: Option<ChatPage>,
+    telemetry: Option<Arc<Telemetry>>,
     out: &mut impl Write,
     remote_api: Option<Arc<CortexClient>>,
 ) -> io::Result<()> {
@@ -1081,6 +1139,7 @@ fn interactive<G: ChatApi + 'static>(
         started = Some(Instant::now());
         let api = api.clone();
         let publisher = remote_publisher.clone();
+        let telemetry = telemetry.clone();
         thread::spawn(move || {
             let mut state = ChatState {
                 chat_id: Some(chat_id.clone()),
@@ -1114,6 +1173,9 @@ fn interactive<G: ChatApi + 'static>(
                     tx.send(Ok(event)).map_err(|_| ChatFailure::Connection)
                 })
             });
+            if let Some(telemetry) = telemetry {
+                telemetry.chat_result(result);
+            }
             if let Err(error) = result {
                 let _ = tx.send(Err(error));
             }
@@ -1258,6 +1320,7 @@ fn interactive<G: ChatApi + 'static>(
                 prompt,
                 file_ids,
                 remote_publisher.clone(),
+                telemetry.clone(),
             ));
             dirty = true;
         }
@@ -1384,6 +1447,7 @@ fn interactive<G: ChatApi + 'static>(
                             text,
                             Vec::new(),
                             remote_publisher.clone(),
+                            telemetry.clone(),
                         ));
                     }
                     KeyCode::Char(c) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
@@ -2003,7 +2067,7 @@ mod tests {
         assert!(io::stdin().is_terminal());
         let mut out = io::stdout().lock();
         write!(out, "\x1b[2J\x1b[H").unwrap();
-        interactive(Arc::new(Fixture), None, None, &mut out, None).unwrap();
+        interactive(Arc::new(Fixture), None, None, None, &mut out, None).unwrap();
         assert_eq!(*DETAIL_STATES.lock().unwrap(), vec![true, false]);
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     }
@@ -2012,7 +2076,7 @@ mod tests {
     fn terminal_cancel_fixture() {
         assert!(io::stdin().is_terminal());
         let mut out = io::stdout().lock();
-        interactive(Arc::new(Fixture), None, None, &mut out, None).unwrap();
+        interactive(Arc::new(Fixture), None, None, None, &mut out, None).unwrap();
         assert_eq!(
             *CANCELLATIONS.lock().unwrap(),
             vec![(

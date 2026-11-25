@@ -3,12 +3,15 @@
 pub mod models {
     pub mod chat;
     pub mod native_auth;
+    pub mod provider;
     pub mod remote_control;
+    pub mod telemetry;
     pub mod tools;
 }
 pub mod services {
     pub mod auth;
     pub mod chat;
     pub mod remote_control;
+    pub mod telemetry;
     pub mod tools;
 }
