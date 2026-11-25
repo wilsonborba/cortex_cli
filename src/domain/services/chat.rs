@@ -94,7 +94,7 @@ pub struct PendingOutputAction {
     pub request: ToolRequest,
     pub receipt: OutputActionReceipt,
     pub preimage: crate::domain::services::tools::ActionPreimage,
-    pub answer: Option<bool>,
+    pub completed_result: Option<String>,
 }
 
 pub fn latest_chat(api: &impl ChatApi) -> Result<Option<String>, ChatFailure> {

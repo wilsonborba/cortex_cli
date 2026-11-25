@@ -461,7 +461,7 @@ fn submit_tool_call(
                                     request,
                                     receipt,
                                     preimage,
-                                    answer: None,
+                                    completed_result: None,
                                 });
                             return Ok(());
                         }
@@ -508,29 +508,52 @@ fn answer_pending_action(
         (Some(chat), Some(output)) => (chat, output),
         _ => return Err(ChatFailure::InvalidResponse),
     };
+    if let Some(result) = pending.completed_result {
+        api.submit_tool_result(
+            chat,
+            output,
+            &ToolResult {
+                call_id: pending.request.call_id,
+                name: pending.request.name,
+                output: result,
+            },
+        )?;
+        state.pending_action = None;
+        return Ok(());
+    }
     let current =
         api.get_output_action(remote_session, chat, output, &pending.receipt.action_id)?;
     if !current.matches(&pending.request) {
         return Err(ChatFailure::InvalidResponse);
     }
-    let answered = match current.status.as_str() {
-        "approved" if approved => current,
-        "denied" if !approved => current,
-        "pending" => api.answer_output_action(
+    let effective_approval = match current.status.as_str() {
+        "approved" => true,
+        "denied" => false,
+        "pending" => approved,
+        _ => return Err(ChatFailure::InvalidResponse),
+    };
+    let answered = if current.status == "pending" {
+        api.answer_output_action(
             remote_session,
             chat,
             output,
             &pending.receipt.action_id,
-            approved,
-        )?,
-        _ => return Err(ChatFailure::InvalidResponse),
+            effective_approval,
+        )?
+    } else {
+        current
     };
     if !answered.matches(&pending.request)
-        || answered.status != if approved { "approved" } else { "denied" }
+        || answered.status
+            != if effective_approval {
+                "approved"
+            } else {
+                "denied"
+            }
     {
         return Err(ChatFailure::InvalidResponse);
     }
-    let output_text = if approved {
+    let output_text = if effective_approval {
         let claimed = api.claim_output_action(
             remote_session,
             chat,
@@ -550,6 +573,11 @@ fn answer_pending_action(
     } else {
         "Not executed: approval was denied.".into()
     };
+    if let Some(action) = state.pending_action.as_mut() {
+        action.completed_result = Some(output_text.clone());
+    } else {
+        return Err(ChatFailure::InvalidResponse);
+    }
     api.submit_tool_result(
         chat,
         output,
@@ -652,6 +680,11 @@ impl RemoteCommandQueue {
                 RemoteEventKind::CommandExpired => "command_expired",
                 _ => "unsupported_command",
             };
+            if status == "approval_failed" {
+                self.retry_at = Instant::now() + reconnect_delay(self.retry_attempt);
+                self.retry_attempt = self.retry_attempt.saturating_add(1);
+                break;
+            }
             if remote
                 .api
                 .acknowledge_remote_command(&remote.session_id, event.id, status)
