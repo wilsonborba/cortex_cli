@@ -6,6 +6,7 @@
 pub mod local {
     pub mod provider_key;
     pub mod session;
+    pub mod telemetry_consent;
 }
 pub mod remote {
     pub mod chat;
