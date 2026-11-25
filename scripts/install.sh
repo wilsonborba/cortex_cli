@@ -99,7 +99,14 @@ else
 fi
 
 TEMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TEMP_DIR"' EXIT
+STAGED_INSTALL=""
+cleanup() {
+  if [[ -n "$STAGED_INSTALL" ]]; then
+    rm -f "$STAGED_INSTALL"
+  fi
+  rm -rf "$TEMP_DIR"
+}
+trap cleanup EXIT
 download "$ARCHIVE_URL" "$TEMP_DIR/$ASSET"
 download "$CHECKSUMS_URL" "$TEMP_DIR/SHA256SUMS"
 
@@ -117,10 +124,21 @@ if [[ "$MEMBERS" != cortex ]]; then
   echo "The release archive must contain only the cortex executable." >&2
   exit 1
 fi
+DETAILS="$(tar -tvzf "$TEMP_DIR/$ASSET")"
+if [[ "${DETAILS:0:1}" != "-" ]]; then
+  echo "The release archive member must be a regular file." >&2
+  exit 1
+fi
 tar -xzf "$TEMP_DIR/$ASSET" -C "$TEMP_DIR"
+if [[ -L "$TEMP_DIR/cortex" || ! -f "$TEMP_DIR/cortex" || ! -x "$TEMP_DIR/cortex" ]]; then
+  echo "The release archive member must be an executable regular file." >&2
+  exit 1
+fi
 mkdir -p "$INSTALL_DIR"
-install -m 0755 "$TEMP_DIR/cortex" "$INSTALL_DIR/cortex.new.$$"
-mv -f "$INSTALL_DIR/cortex.new.$$" "$INSTALL_DIR/cortex"
+STAGED_INSTALL="$(mktemp "$INSTALL_DIR/.cortex.new.XXXXXX")"
+install -m 0755 "$TEMP_DIR/cortex" "$STAGED_INSTALL"
+mv -f "$STAGED_INSTALL" "$INSTALL_DIR/cortex"
+STAGED_INSTALL=""
 
 echo "Installed Cortex v${VERSION} to ${INSTALL_DIR}/cortex."
 echo "Add ${INSTALL_DIR} to PATH if needed; the installer does not edit shell configuration."
