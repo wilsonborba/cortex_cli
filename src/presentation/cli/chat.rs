@@ -28,8 +28,12 @@ use crate::{
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::{
     io::{self, IsTerminal, Write},
-    sync::{Arc, mpsc},
-    thread,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -37,20 +41,60 @@ const KITTY_HOLD_THRESHOLD: Duration = Duration::from_millis(260);
 const FALLBACK_TAP_TIMEOUT: Duration = Duration::from_millis(700);
 const FALLBACK_RELEASE_TIMEOUT: Duration = Duration::from_millis(350);
 
+struct VoiceJob {
+    receiver: mpsc::Receiver<Result<String, crate::dal::local::voice::VoiceFailure>>,
+    cancel: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl VoiceJob {
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    fn join_completed(mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for VoiceJob {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+fn spawn_voice_job<F>(samples: Vec<f32>, transcribe: F) -> VoiceJob
+where
+    F: FnOnce(&[f32], &Arc<AtomicBool>) -> Result<String, crate::dal::local::voice::VoiceFailure>
+        + Send
+        + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let worker = thread::spawn(move || {
+        let samples = zeroize::Zeroizing::new(samples);
+        let result = transcribe(&samples, &worker_cancel);
+        drop(samples);
+        let _ = sender.send(result);
+    });
+    VoiceJob {
+        receiver,
+        cancel,
+        worker: Some(worker),
+    }
+}
+
 fn transcribe_in_background(
     recorder: crate::dal::local::voice::Recorder,
-) -> Result<
-    mpsc::Receiver<Result<String, crate::dal::local::voice::VoiceFailure>>,
-    crate::dal::local::voice::VoiceFailure,
-> {
-    use crate::dal::local::voice;
+) -> Result<VoiceJob, crate::dal::local::voice::VoiceFailure> {
     let samples = recorder.stop()?;
-    let samples = zeroize::Zeroizing::new(samples);
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(voice::transcribe(&samples));
-    });
-    Ok(receiver)
+    Ok(spawn_voice_job(
+        samples,
+        crate::dal::local::voice::transcribe,
+    ))
 }
 
 fn insert_voice_transcript(editor: &mut Editor, transcript: &str) {
@@ -59,6 +103,47 @@ fn insert_voice_transcript(editor: &mut Editor, transcript: &str) {
 
 fn cancel_voice_capture<T>(capture: &mut Option<T>) -> bool {
     capture.take().is_some()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceKeyAction {
+    Cancel,
+    Exit,
+    Ignore,
+}
+
+fn voice_key_action(code: KeyCode, modifiers: KeyModifiers) -> VoiceKeyAction {
+    if code == KeyCode::Esc
+        || (modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'C')))
+    {
+        VoiceKeyAction::Cancel
+    } else if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('d' | 'D'))
+    {
+        VoiceKeyAction::Exit
+    } else {
+        VoiceKeyAction::Ignore
+    }
+}
+
+fn handle_voice_job_key(
+    job: &VoiceJob,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    exit_after_voice: &mut bool,
+    status: &mut Option<String>,
+) {
+    match voice_key_action(code, modifiers) {
+        VoiceKeyAction::Cancel => {
+            job.cancel();
+            *status = Some("Cancellation requested; stopping local transcription...".into());
+        }
+        VoiceKeyAction::Exit => {
+            *exit_after_voice = true;
+            job.cancel();
+            *status = Some("Stopping local transcription before exit...".into());
+        }
+        VoiceKeyAction::Ignore => {}
+    }
 }
 
 fn failure(error: impl ToString) -> io::Error {
@@ -189,10 +274,9 @@ fn interactive<G: ChatApi + 'static>(
     let mut pending_space: Option<Instant> = None;
     let mut recording: Option<(crate::dal::local::voice::Recorder, Instant, bool)> = None;
     let mut last_repeat: Option<Instant> = None;
-    let mut voice_receiver: Option<
-        mpsc::Receiver<Result<String, crate::dal::local::voice::VoiceFailure>>,
-    > = None;
+    let mut voice_job: Option<VoiceJob> = None;
     let mut voice_status: Option<String> = None;
+    let mut exit_after_voice = false;
     if let (Some(chat_id), Some(output_id)) = (chat.clone(), running) {
         let (tx, rx) = mpsc::channel();
         receiver = Some(rx);
@@ -241,29 +325,33 @@ fn interactive<G: ChatApi + 'static>(
                 let (recorder, _, _) = recording.take().expect("recording is present");
                 last_repeat = None;
                 match transcribe_in_background(recorder) {
-                    Ok(receiver) => {
-                        voice_receiver = Some(receiver);
+                    Ok(job) => {
+                        voice_job = Some(job);
                         voice_status = Some("Transcribing locally...".into());
                     }
                     Err(error) => voice_status = Some(error.to_string()),
                 }
             }
         }
-        if let Some(rx) = voice_receiver.as_ref() {
-            match rx.try_recv() {
-                Ok(Ok(text)) => {
-                    insert_voice_transcript(&mut editor, &text);
-                    voice_receiver = None;
-                    voice_status = None;
-                    dirty = true;
-                }
-                Ok(Err(error)) => {
-                    voice_receiver = None;
-                    voice_status = Some(error.to_string());
+        if let Some(job) = voice_job.as_ref() {
+            match job.receiver.try_recv() {
+                Ok(result) => {
+                    if let Some(job) = voice_job.take() {
+                        job.join_completed();
+                    }
+                    match result {
+                        Ok(text) => {
+                            insert_voice_transcript(&mut editor, &text);
+                            voice_status = None;
+                        }
+                        Err(error) => voice_status = Some(error.to_string()),
+                    }
                     dirty = true;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    voice_receiver = None;
+                    if let Some(job) = voice_job.take() {
+                        job.join_completed();
+                    }
                     voice_status = Some("Local speech transcription failed.".into());
                     dirty = true;
                 }
@@ -318,7 +406,7 @@ fn interactive<G: ChatApi + 'static>(
                 dirty = true;
             }
         }
-        if dirty || receiver.is_some() || recording.is_some() || voice_receiver.is_some() {
+        if dirty || receiver.is_some() || recording.is_some() || voice_job.is_some() {
             surface.paint(
                 out,
                 &state,
@@ -332,6 +420,10 @@ fn interactive<G: ChatApi + 'static>(
                 voice_status.as_deref(),
             )?;
             dirty = false;
+        }
+        if exit_after_voice && voice_job.is_none() {
+            surface.clear(out)?;
+            return surface.text(out, "\n");
         }
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -347,8 +439,8 @@ fn interactive<G: ChatApi + 'static>(
             {
                 if let Some((recorder, _, true)) = recording.take() {
                     match transcribe_in_background(recorder) {
-                        Ok(receiver) => {
-                            voice_receiver = Some(receiver);
+                        Ok(job) => {
+                            voice_job = Some(job);
                             voice_status = Some("Transcribing locally...".into());
                         }
                         Err(error) => voice_status = Some(error.to_string()),
@@ -360,7 +452,7 @@ fn interactive<G: ChatApi + 'static>(
             Event::Key(key)
                 if key.kind != KeyEventKind::Release
                     && receiver.is_none()
-                    && voice_receiver.is_none()
+                    && voice_job.is_none()
                     && key.code == KeyCode::Char(' ') =>
             {
                 let now = Instant::now();
@@ -406,7 +498,14 @@ fn interactive<G: ChatApi + 'static>(
                     }
                     continue;
                 }
-                if voice_receiver.is_some() {
+                if let Some(job) = voice_job.as_ref() {
+                    handle_voice_job_key(
+                        job,
+                        key.code,
+                        key.modifiers,
+                        &mut exit_after_voice,
+                        &mut voice_status,
+                    );
                     continue;
                 }
                 if control && matches!(key.code, KeyCode::Char('c' | 'C')) {
@@ -619,6 +718,77 @@ mod tests {
         assert_eq!(editor.text, transcript);
         assert_eq!(editor.cursor, transcript.len());
         assert_eq!(SENDS.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn voice_job_escape_and_ctrl_c_cancel_while_ctrl_d_waits_for_worker_exit() {
+        use crate::dal::local::voice::VoiceFailure;
+
+        assert_eq!(
+            voice_key_action(KeyCode::Esc, KeyModifiers::NONE),
+            VoiceKeyAction::Cancel
+        );
+        assert_eq!(
+            voice_key_action(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            VoiceKeyAction::Cancel
+        );
+        assert_eq!(
+            voice_key_action(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            VoiceKeyAction::Exit
+        );
+
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_started = Arc::clone(&started);
+        let worker_stopped = Arc::clone(&stopped);
+        let job = spawn_voice_job(vec![0.25, -0.5], move |samples, cancel| {
+            assert_eq!(samples, [0.25, -0.5]);
+            worker_started.store(true, Ordering::SeqCst);
+            while !cancel.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            worker_stopped.store(true, Ordering::SeqCst);
+            Err(VoiceFailure::Cancelled)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(started.load(Ordering::SeqCst));
+        assert!(matches!(
+            job.receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let mut exit_after_voice = false;
+        let mut status = None;
+        handle_voice_job_key(
+            &job,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            &mut exit_after_voice,
+            &mut status,
+        );
+        assert!(job.cancel.load(Ordering::SeqCst));
+        assert!(!exit_after_voice);
+        assert!(
+            status
+                .as_deref()
+                .unwrap()
+                .contains("Cancellation requested")
+        );
+        handle_voice_job_key(
+            &job,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            &mut exit_after_voice,
+            &mut status,
+        );
+        assert!(exit_after_voice);
+        assert!(status.as_deref().unwrap().contains("before exit"));
+        let result = job.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(result, Err(VoiceFailure::Cancelled));
+        assert!(stopped.load(Ordering::SeqCst));
+        job.join_completed();
     }
 
     #[test]
