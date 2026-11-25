@@ -45,11 +45,20 @@ fn transcribe_in_background(
 > {
     use crate::dal::local::voice;
     let samples = recorder.stop()?;
+    let samples = zeroize::Zeroizing::new(samples);
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let _ = sender.send(voice::transcribe(&samples));
     });
     Ok(receiver)
+}
+
+fn insert_voice_transcript(editor: &mut Editor, transcript: &str) {
+    editor.insert(transcript);
+}
+
+fn cancel_voice_capture<T>(capture: &mut Option<T>) -> bool {
+    capture.take().is_some()
 }
 
 fn failure(error: impl ToString) -> io::Error {
@@ -243,7 +252,7 @@ fn interactive<G: ChatApi + 'static>(
         if let Some(rx) = voice_receiver.as_ref() {
             match rx.try_recv() {
                 Ok(Ok(text)) => {
-                    editor.insert(&text);
+                    insert_voice_transcript(&mut editor, &text);
                     voice_receiver = None;
                     voice_status = None;
                     dirty = true;
@@ -391,7 +400,7 @@ fn interactive<G: ChatApi + 'static>(
                 }
                 if recording.is_some() {
                     if key.code == KeyCode::Esc {
-                        recording = None;
+                        cancel_voice_capture(&mut recording);
                         last_repeat = None;
                         voice_status = Some("Recording cancelled.".into());
                     }
@@ -486,6 +495,23 @@ mod tests {
         std::sync::Mutex::new(Vec::new());
     static CANCELLATIONS: std::sync::Mutex<Vec<(String, String)>> =
         std::sync::Mutex::new(Vec::new());
+    static SENDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    struct CaptureProbe {
+        samples: Vec<f32>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for CaptureProbe {
+        fn drop(&mut self) {
+            crate::dal::local::voice::clear_audio_samples(&mut self.samples);
+            self.dropped.store(
+                self.samples.iter().all(|sample| *sample == 0.0),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+
     struct Fixture;
     struct SlowFrames {
         frames: VecDeque<Vec<u8>>,
@@ -511,6 +537,7 @@ mod tests {
     }
     impl ChatApi for Fixture {
         fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+            SENDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let steps = [
                 (
                     "stage",
@@ -564,6 +591,34 @@ mod tests {
                 .push((chat.into(), output.into()));
             Ok(())
         }
+    }
+
+    #[test]
+    fn synthetic_voice_cancel_drops_samples_without_sending_a_prompt() {
+        SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut capture = Some(CaptureProbe {
+            samples: vec![0.125, -0.25, 0.5],
+            dropped: dropped.clone(),
+        });
+
+        assert!(cancel_voice_capture(&mut capture));
+        assert!(capture.is_none());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(SENDS.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn synthetic_voice_transcript_stays_editable_and_preserves_unicode_without_sending() {
+        SENDS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let transcript = "สวัสดี, olá, hello";
+        let mut editor = Editor::default();
+
+        insert_voice_transcript(&mut editor, transcript);
+
+        assert_eq!(editor.text, transcript);
+        assert_eq!(editor.cursor, transcript.len());
+        assert_eq!(SENDS.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

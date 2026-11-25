@@ -13,6 +13,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use zeroize::Zeroize;
 
 const RATE: u32 = 16_000;
 const SMALL_NAME: &str = "ggml-small-q5_1.bin";
@@ -20,6 +21,10 @@ const BASE_NAME: &str = "ggml-base-q5_1.bin";
 const SMALL_SHA256: &str = "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb";
 const BASE_SHA256: &str = "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898";
 const MODEL_REVISION: &str = "87cd18b47b941d2f65d09981dad23bb7d0481c77";
+
+pub(crate) fn clear_audio_samples(samples: &mut [f32]) {
+    samples.zeroize();
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VoiceFailure {
@@ -135,12 +140,25 @@ impl Recorder {
             .lock()
             .map_err(|_| VoiceFailure::Microphone)?
             .clone();
-        let mono = downmix(&interleaved, self.channels);
-        let samples = resample(&mono, self.source_rate, RATE);
+        let mut interleaved = interleaved;
+        let mut mono = downmix(&interleaved, self.channels);
+        clear_audio_samples(&mut interleaved);
+        let mut samples = resample(&mono, self.source_rate, RATE);
+        clear_audio_samples(&mut mono);
         if samples.len() < (RATE / 5) as usize {
+            clear_audio_samples(&mut samples);
             return Err(VoiceFailure::NoSpeech);
         }
         Ok(samples)
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        let _ = self.stream.pause();
+        if let Ok(mut samples) = self.samples.lock() {
+            clear_audio_samples(&mut samples);
+        }
     }
 }
 
