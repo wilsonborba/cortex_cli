@@ -101,6 +101,25 @@ fn insert_voice_transcript(editor: &mut Editor, transcript: &str) {
     editor.insert(transcript);
 }
 
+fn complete_voice_job(
+    job: VoiceJob,
+    result: Result<String, crate::dal::local::voice::VoiceFailure>,
+    editor: &mut Editor,
+) -> Option<String> {
+    let cancelled = job.cancel.load(Ordering::Relaxed);
+    job.join_completed();
+    if cancelled {
+        return Some("Transcription cancelled; no text inserted.".into());
+    }
+    match result {
+        Ok(text) => {
+            insert_voice_transcript(editor, &text);
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    }
+}
+
 fn cancel_voice_capture<T>(capture: &mut Option<T>) -> bool {
     capture.take().is_some()
 }
@@ -337,14 +356,7 @@ fn interactive<G: ChatApi + 'static>(
             match job.receiver.try_recv() {
                 Ok(result) => {
                     if let Some(job) = voice_job.take() {
-                        job.join_completed();
-                    }
-                    match result {
-                        Ok(text) => {
-                            insert_voice_transcript(&mut editor, &text);
-                            voice_status = None;
-                        }
-                        Err(error) => voice_status = Some(error.to_string()),
+                        voice_status = complete_voice_job(job, result, &mut editor);
                     }
                     dirty = true;
                 }
@@ -718,6 +730,45 @@ mod tests {
         assert_eq!(editor.text, transcript);
         assert_eq!(editor.cursor, transcript.len());
         assert_eq!(SENDS.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn accepted_cancel_discards_successful_result_from_worker_that_ignores_cancel() {
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let job = spawn_voice_job(vec![0.25], move |_, _cancel| {
+            worker_entered.store(true, Ordering::SeqCst);
+            while !worker_release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok("cancelled text must not appear".into())
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(entered.load(Ordering::SeqCst));
+        let mut editor = Editor::default();
+        let mut exit_after_voice = false;
+        let mut status = None;
+        handle_voice_job_key(
+            &job,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            &mut exit_after_voice,
+            &mut status,
+        );
+        release.store(true, Ordering::SeqCst);
+        let result = job.receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(result.as_deref(), Ok("cancelled text must not appear"));
+        let status = complete_voice_job(job, result, &mut editor);
+        assert_eq!(editor.text, "");
+        assert_eq!(
+            status.as_deref(),
+            Some("Transcription cancelled; no text inserted.")
+        );
     }
 
     #[test]
