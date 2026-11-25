@@ -1,12 +1,13 @@
 //! Provider key setup and one-shot API requests.
 
 use crate::{
+    core::terminal_text::clean,
     dal::{local::provider_key, remote::provider::ProviderClient},
     domain::models::provider::Provider,
     presentation::cli::commands::{ChatOptions, ProviderCommand},
 };
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal,
 };
 use std::io::{self, IsTerminal, Write};
@@ -46,8 +47,7 @@ fn read_key() -> io::Result<Zeroizing<String>> {
                 KeyCode::Backspace => {
                     value.pop();
                 }
-                KeyCode::Char(_) if !key.modifiers.is_empty() => {}
-                KeyCode::Char(c) => value.push(c),
+                KeyCode::Char(c) if printable_key_char(key).is_some() => value.push(c),
                 _ => {}
             }
         }
@@ -56,6 +56,22 @@ fn read_key() -> io::Result<Zeroizing<String>> {
         return Err(io::Error::other("Provider key cannot be empty."));
     }
     Ok(value)
+}
+
+fn printable_key_char(key: KeyEvent) -> Option<char> {
+    let disallowed = KeyModifiers::CONTROL
+        | KeyModifiers::ALT
+        | KeyModifiers::SUPER
+        | KeyModifiers::HYPER
+        | KeyModifiers::META;
+    match key.code {
+        KeyCode::Char(c) if !key.modifiers.intersects(disallowed) => Some(c),
+        _ => None,
+    }
+}
+
+fn write_provider_answer(out: &mut impl Write, answer: &str) -> io::Result<()> {
+    writeln!(out, "{}", clean(answer))
 }
 
 pub fn manage(command: ProviderCommand, out: &mut impl Write) -> io::Result<()> {
@@ -115,5 +131,44 @@ pub fn complete(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
     let answer = client
         .complete(provider, key.as_str(), &model, &prompt)
         .map_err(io::Error::other)?;
-    writeln!(out, "{answer}")
+    write_provider_answer(out, &answer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{printable_key_char, write_provider_answer};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn shifted_characters_are_kept_and_control_modifiers_are_ignored() {
+        assert_eq!(
+            printable_key_char(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            Some('A')
+        );
+        assert_eq!(
+            printable_key_char(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some('a')
+        );
+        for modifier in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            assert_eq!(
+                printable_key_char(KeyEvent::new(KeyCode::Char('c'), modifier)),
+                None
+            );
+        }
+        assert_eq!(
+            printable_key_char(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_answer_strips_terminal_controls_and_preserves_unicode() {
+        let mut output = Vec::new();
+        write_provider_answer(&mut output, "safe\x1b]52;c;secret\x07 สวัสดี\x1b[31m!").unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "safe สวัสดี!\n");
+    }
 }
