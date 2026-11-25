@@ -1,10 +1,17 @@
 use std::{
+    collections::VecDeque,
     fs,
     path::{Component, Path, PathBuf},
 };
 
-use crate::domain::models::tools::{MAX_TOOL_RESULT_BYTES, ToolName, ToolRequest};
+use crate::domain::models::tools::{
+    MAX_TOOL_RESULT_BYTES, MAX_VIEW_FILE_LINES, ToolName, ToolRequest,
+};
 use serde::Deserialize;
+
+const MAX_GREP_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_GREP_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_GREP_VISITED_PATHS: usize = 5000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolError {
@@ -90,6 +97,16 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, ToolError> {
 }
 
 fn view_file(root: &Path, args: &ViewFileArgs) -> Result<String, ToolError> {
+    let start_line = args.start_line.unwrap_or(1);
+    if start_line == 0 || args.end_line == Some(0) {
+        return Err(ToolError::ReadFailed);
+    }
+    let end_line = args
+        .end_line
+        .unwrap_or_else(|| start_line.saturating_add(MAX_VIEW_FILE_LINES - 1));
+    if end_line < start_line || end_line.saturating_sub(start_line) >= MAX_VIEW_FILE_LINES {
+        return Err(ToolError::ReadFailed);
+    }
     let path = resolve(root, &args.path)?;
     if fs::metadata(&path)
         .map_err(|_| ToolError::ReadFailed)?
@@ -99,16 +116,13 @@ fn view_file(root: &Path, args: &ViewFileArgs) -> Result<String, ToolError> {
         return Err(ToolError::ResultTooLarge);
     }
     let content = fs::read_to_string(path).map_err(|_| ToolError::ReadFailed)?;
-    let start_line = args.start_line.unwrap_or(1).max(1);
     let start = start_line as usize;
-    let end = args.end_line.unwrap_or(start_line.saturating_add(500)) as usize;
+    let take = end_line
+        .saturating_sub(start_line)
+        .saturating_add(1)
+        .min(MAX_VIEW_FILE_LINES) as usize;
     let mut output = String::new();
-    for (index, line) in content
-        .lines()
-        .enumerate()
-        .skip(start - 1)
-        .take(end - start + 1)
-    {
+    for (index, line) in content.lines().enumerate().skip(start - 1).take(take) {
         output.push_str(&format!("{}: {}\n", index + 1, line));
         if output.len() > MAX_TOOL_RESULT_BYTES {
             return Err(ToolError::ResultTooLarge);
@@ -123,15 +137,17 @@ fn view_file(root: &Path, args: &ViewFileArgs) -> Result<String, ToolError> {
 
 fn grep(root: &Path, args: &GrepArgs) -> Result<String, ToolError> {
     let max = args.max_results.unwrap_or(50).min(100) as usize;
-    let mut pending = Vec::new();
+    let mut pending = VecDeque::new();
     for path in &args.paths {
-        pending.push(resolve(root, path)?);
+        pending.push_back(resolve(root, path)?);
     }
     let mut output = String::new();
     let mut visited = 0usize;
-    while let Some(path) = pending.pop() {
+    let mut scanned_bytes = 0u64;
+    let mut result_count = 0usize;
+    'search: while let Some(path) = pending.pop_back() {
         visited += 1;
-        if visited > 5000 || output.len() >= MAX_TOOL_RESULT_BYTES {
+        if visited > MAX_GREP_VISITED_PATHS || output.len() >= MAX_TOOL_RESULT_BYTES {
             break;
         }
         let path = path.canonicalize().map_err(|_| ToolError::ReadFailed)?;
@@ -155,12 +171,18 @@ fn grep(root: &Path, args: &GrepArgs) -> Result<String, ToolError> {
                 {
                     continue;
                 }
-                pending.push(entry.path());
+                if pending.len() + visited < MAX_GREP_VISITED_PATHS {
+                    pending.push_back(entry.path());
+                }
             }
             continue;
         }
-        if metadata.len() > 2 * 1024 * 1024 {
+        if metadata.len() > MAX_GREP_FILE_BYTES {
             continue;
+        }
+        scanned_bytes = scanned_bytes.saturating_add(metadata.len());
+        if scanned_bytes > MAX_GREP_SCAN_BYTES {
+            break;
         }
         let Ok(content) = fs::read_to_string(&path) else {
             continue;
@@ -176,8 +198,12 @@ fn grep(root: &Path, args: &GrepArgs) -> Result<String, ToolError> {
                     line_number + 1,
                     line
                 ));
-                if output.lines().count() >= max || output.len() > MAX_TOOL_RESULT_BYTES {
-                    break;
+                result_count += 1;
+                if result_count >= max {
+                    break 'search;
+                }
+                if output.len() > MAX_TOOL_RESULT_BYTES {
+                    return Err(ToolError::ResultTooLarge);
                 }
             }
         }
@@ -236,5 +262,33 @@ mod tests {
             );
         }
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn grep_result_limit_applies_across_files_in_a_directory() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cortex-cli-grep-bound-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.join(name), "needle\n").unwrap();
+        }
+        for paths in [
+            serde_json::json!(["a.txt", "b.txt", "c.txt"]),
+            serde_json::json!(["."]),
+        ] {
+            let request = ToolRequest::from_event(&serde_json::json!({
+                "call_id":"30000000-0000-4000-8000-000000000003",
+                "name":"grep_search",
+                "arguments":{"query":"needle","paths":paths,"max_results":1}
+            }))
+            .unwrap();
+
+            let result = execute_readonly_at(&request, &root).unwrap().unwrap();
+            assert_eq!(result.lines().count(), 1);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

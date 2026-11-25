@@ -76,3 +76,23 @@ fn event_parser_accepts_only_the_five_mapped_tool_names() {
         Err(ChatFailure::InvalidResponse)
     ));
 }
+
+#[test]
+fn view_file_rejects_zero_and_ranges_over_500_inclusive_lines() {
+    for arguments in [
+        json!({"path":"Cargo.toml","start_line":0}),
+        json!({"path":"Cargo.toml","end_line":0}),
+        json!({"path":"Cargo.toml","start_line":0,"end_line":0}),
+        json!({"path":"Cargo.toml","start_line":1,"end_line":501}),
+    ] {
+        assert!(
+            ToolRequest::from_event(
+                &json!({"call_id":CALL,"name":"view_file","arguments":arguments})
+            )
+            .is_err()
+        );
+    }
+    assert!(ToolRequest::from_event(
+        &json!({"call_id":CALL,"name":"view_file","arguments":{"path":"Cargo.toml","start_line":1,"end_line":500}})
+    ).is_ok());
+}

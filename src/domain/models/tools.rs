@@ -4,6 +4,7 @@ use serde_json::Value;
 use super::chat::{ChatFailure, valid_id};
 
 pub const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
+pub const MAX_VIEW_FILE_LINES: u32 = 500;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -117,9 +118,11 @@ impl ToolRequest {
                     .map_err(|_| ChatFailure::InvalidResponse)?;
                 let first = args.start_line.unwrap_or(1);
                 if !bounded(&args.path, 1024)
-                    || args
-                        .end_line
-                        .is_some_and(|end| end < first || end.saturating_sub(first) > 500)
+                    || args.start_line == Some(0)
+                    || args.end_line == Some(0)
+                    || args.end_line.is_some_and(|end| {
+                        end < first || end.saturating_sub(first) >= MAX_VIEW_FILE_LINES
+                    })
                 {
                     return Err(ChatFailure::InvalidResponse);
                 }
