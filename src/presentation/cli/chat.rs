@@ -113,12 +113,32 @@ impl RemotePublisher {
 
 struct RemoteSessionGuard {
     api: Arc<CortexClient>,
+    commands: Arc<dyn RemoteCommandApi>,
+    registered: bool,
     session_id: String,
     receiver: mpsc::Receiver<RemoteEvent>,
     cursor: Arc<AtomicU64>,
     listener_online: Arc<AtomicBool>,
     publisher: RemotePublisher,
     stop: Arc<AtomicBool>,
+}
+
+trait RemoteCommandApi: Send + Sync {
+    fn chat_api(&self) -> &dyn ChatApi;
+    fn cancel_output(&self, chat: &str, output: &str) -> Result<(), ChatFailure>;
+    fn acknowledge_command(&self, session: &str, id: u64, status: &str) -> Result<(), ChatFailure>;
+}
+
+impl RemoteCommandApi for CortexClient {
+    fn chat_api(&self) -> &dyn ChatApi {
+        self
+    }
+    fn cancel_output(&self, chat: &str, output: &str) -> Result<(), ChatFailure> {
+        self.cancel(chat, output)
+    }
+    fn acknowledge_command(&self, session: &str, id: u64, status: &str) -> Result<(), ChatFailure> {
+        self.acknowledge_remote_command(session, id, status)
+    }
 }
 
 #[derive(Default)]
@@ -134,6 +154,9 @@ struct ActionWorker {
     thread: Option<JoinHandle<()>>,
     retry_at: Instant,
     cancel_command: Option<u64>,
+    owned_action_id: Option<String>,
+    owned_call_id: Option<String>,
+    owned_approval: Option<bool>,
 }
 
 impl Default for ActionWorker {
@@ -144,6 +167,9 @@ impl Default for ActionWorker {
             thread: None,
             retry_at: Instant::now(),
             cancel_command: None,
+            owned_action_id: None,
+            owned_call_id: None,
+            owned_approval: None,
         }
     }
 }
@@ -153,9 +179,12 @@ impl ActionWorker {
         &mut self,
         request: crate::domain::models::tools::ToolRequest,
         preimage: crate::domain::services::tools::ActionPreimage,
+        action_id: String,
+        approved: bool,
     ) {
         self.cancel();
         self.join();
+        let owned_call_id = request.call_id.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let (sender, receiver) = mpsc::channel();
@@ -171,6 +200,15 @@ impl ActionWorker {
         self.result = Some(receiver);
         self.thread = Some(handle);
         self.retry_at = Instant::now();
+        self.owned_action_id = Some(action_id);
+        self.owned_call_id = Some(owned_call_id);
+        self.owned_approval = Some(approved);
+    }
+
+    fn owns_approval(&self, action_id: &str, call_id: &str, approved: bool) -> bool {
+        self.owned_action_id.as_deref() == Some(action_id)
+            && self.owned_call_id.as_deref() == Some(call_id)
+            && self.owned_approval == Some(approved)
     }
 
     fn cancel(&self) {
@@ -247,7 +285,9 @@ impl RemoteSessionGuard {
             failed: failed.clone(),
         };
         let guard = Self {
-            api,
+            api: api.clone(),
+            commands: api,
+            registered: true,
             session_id,
             receiver,
             cursor,
@@ -314,7 +354,9 @@ impl Drop for RemoteSessionGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.publisher.stop();
-        let _ = self.api.unregister_remote_session(&self.session_id);
+        if self.registered {
+            let _ = self.api.unregister_remote_session(&self.session_id);
+        }
     }
 }
 
@@ -503,7 +545,7 @@ fn begin_turn<G: ChatApi + 'static>(
 }
 
 fn submit_tool_call(
-    api: &impl ChatApi,
+    api: &dyn ChatApi,
     state: &mut ChatState,
     remote_session: Option<&str>,
 ) -> Result<(), ChatFailure> {
@@ -578,7 +620,7 @@ fn submit_tool_call(
 }
 
 fn answer_pending_action(
-    api: &impl ChatApi,
+    api: &dyn ChatApi,
     state: &mut ChatState,
     remote_session: &str,
     approved: bool,
@@ -610,6 +652,15 @@ fn answer_pending_action(
         api.get_output_action(remote_session, &chat, &output, &pending.receipt.action_id)?;
     if !current.matches(&pending.request) {
         return Err(ChatFailure::InvalidResponse);
+    }
+    if current.status == "claimed"
+        && worker.owns_approval(
+            &pending.receipt.action_id,
+            &pending.request.call_id,
+            approved,
+        )
+    {
+        return Ok(());
     }
     let effective_approval =
         effective_approval(&current.status, approved).ok_or(ChatFailure::InvalidResponse)?;
@@ -645,7 +696,12 @@ fn answer_pending_action(
         if !claimed.matches(&pending.request) || claimed.status != "claimed" {
             return Err(ChatFailure::InvalidResponse);
         }
-        worker.start(pending.request.clone(), pending.preimage.clone());
+        worker.start(
+            pending.request.clone(),
+            pending.preimage.clone(),
+            pending.receipt.action_id.clone(),
+            true,
+        );
         return Ok(());
     } else {
         "Not executed: approval was denied.".into()
@@ -659,7 +715,7 @@ fn answer_pending_action(
 }
 
 fn submit_completed_action_result(
-    api: &impl ChatApi,
+    api: &dyn ChatApi,
     state: &mut ChatState,
     chat: &str,
     output: &str,
@@ -811,7 +867,7 @@ impl RemoteCommandQueue {
                             (state.chat_id.as_deref(), state.output_id.as_deref())
                         {
                             worker.cancel();
-                            match remote.api.cancel(chat, output) {
+                            match remote.commands.cancel_output(chat, output) {
                                 Ok(()) => {
                                     controls.stop_requested = true;
                                     worker.cancel_command = Some(event.id);
@@ -831,25 +887,34 @@ impl RemoteCommandQueue {
                 RemoteEventKind::ApprovalAnswer => {
                     let decision = event.payload["approved"].as_bool();
                     let action_id = event.payload["approval_id"].as_str();
-                    if let (Some(approved), Some(action_id), Some(pending)) =
-                        (decision, action_id, state.pending_action.as_ref())
-                    {
-                        if action_id == pending.receipt.action_id {
-                            match answer_pending_action(
-                                remote.api.as_ref(),
-                                state,
-                                &remote.session_id,
-                                approved,
-                                worker,
-                            ) {
-                                Ok(()) => "approval_received",
-                                Err(_) => "approval_failed",
+                    match (decision, action_id) {
+                        (Some(approved), Some(action_id)) => {
+                            if state
+                                .pending_action
+                                .as_ref()
+                                .is_some_and(|pending| action_id == pending.receipt.action_id)
+                            {
+                                match answer_pending_action(
+                                    remote.commands.chat_api(),
+                                    state,
+                                    &remote.session_id,
+                                    approved,
+                                    worker,
+                                ) {
+                                    Ok(()) => "approval_received",
+                                    Err(_) => "approval_failed",
+                                }
+                            } else if state.pending_action.is_none()
+                                && worker.owned_action_id.as_deref() == Some(action_id)
+                                && worker.owned_approval == Some(approved)
+                            {
+                                // The exact locally claimed action already received this decision.
+                                "approval_received"
+                            } else {
+                                "stale_approval_answer"
                             }
-                        } else {
-                            "stale_approval_answer"
                         }
-                    } else {
-                        "invalid_approval_answer"
+                        _ => "invalid_approval_answer",
                     }
                 }
                 RemoteEventKind::CommandExpired => "command_expired",
@@ -861,8 +926,8 @@ impl RemoteCommandQueue {
                 break;
             }
             if remote
-                .api
-                .acknowledge_remote_command(&remote.session_id, event.id, status)
+                .commands
+                .acknowledge_command(&remote.session_id, event.id, status)
                 .is_err()
             {
                 self.retry_at = Instant::now() + reconnect_delay(self.retry_attempt);
@@ -1446,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_action_result_retries_delivery_without_rerunning_effect() {
+    fn manager_replayed_phone_approval_acknowledges_inflight_worker() {
         use crate::domain::models::{chat::ChatPage, tools::OutputActionReceipt};
         use std::sync::atomic::AtomicUsize;
 
@@ -1456,6 +1521,10 @@ mod tests {
             outputs: std::sync::Mutex<Vec<String>>,
             claim_response_lost: bool,
             claim_is_ambiguous: AtomicBool,
+            claims: AtomicUsize,
+            acknowledgements: AtomicUsize,
+            fail_first_ack: bool,
+            cancellations: AtomicUsize,
         }
         impl RetryApi {
             fn receipt(&self, status: &str) -> OutputActionReceipt {
@@ -1522,10 +1591,12 @@ mod tests {
                 _: &str,
                 _: &crate::domain::models::tools::ToolRequest,
             ) -> Result<OutputActionReceipt, ChatFailure> {
+                self.claims.fetch_add(1, Ordering::SeqCst);
                 if self.claim_response_lost {
                     self.claim_is_ambiguous.store(true, Ordering::SeqCst);
                     Err(ChatFailure::Connection)
                 } else {
+                    self.claim_is_ambiguous.store(true, Ordering::SeqCst);
                     Ok(self.receipt("claimed"))
                 }
             }
@@ -1548,6 +1619,24 @@ mod tests {
             }
         }
 
+        impl RemoteCommandApi for RetryApi {
+            fn chat_api(&self) -> &dyn ChatApi {
+                self
+            }
+            fn cancel_output(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                self.cancellations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn acknowledge_command(&self, _: &str, _: u64, _: &str) -> Result<(), ChatFailure> {
+                let attempt = self.acknowledgements.fetch_add(1, Ordering::SeqCst);
+                if self.fail_first_ack && attempt == 0 {
+                    Err(ChatFailure::Connection)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
         let request = crate::domain::models::tools::ToolRequest::from_event(&json!({
                 "call_id":"10000000-0000-4000-8000-000000000001",
                 "name":"run_command",
@@ -1563,6 +1652,10 @@ mod tests {
             outputs: std::sync::Mutex::new(Vec::new()),
             claim_response_lost: false,
             claim_is_ambiguous: AtomicBool::new(false),
+            claims: AtomicUsize::new(0),
+            acknowledgements: AtomicUsize::new(0),
+            fail_first_ack: false,
+            cancellations: AtomicUsize::new(0),
         };
         let mut state = ChatState {
             chat_id: Some("10000000-0000-4000-8000-000000000001".into()),
@@ -1605,6 +1698,161 @@ mod tests {
         drop(outputs);
         std::fs::remove_file(marker).unwrap();
 
+        let cancel_marker = std::path::Path::new(".cache_replayed_approval_cancel_fixture");
+        let _ = std::fs::remove_file(cancel_marker);
+        let replay_request = crate::domain::models::tools::ToolRequest::from_event(&json!({
+            "call_id":"60000000-0000-4000-8000-000000000006",
+            "name":"run_command",
+            "arguments":{"cwd":".","argv":["sh","-c","sleep 5; printf x > .cache_replayed_approval_cancel_fixture"]}
+        })).unwrap();
+        let replay_api = Arc::new(RetryApi {
+            request: replay_request.clone(),
+            submissions: AtomicUsize::new(0),
+            outputs: std::sync::Mutex::new(Vec::new()),
+            claim_response_lost: false,
+            claim_is_ambiguous: AtomicBool::new(false),
+            claims: AtomicUsize::new(0),
+            acknowledgements: AtomicUsize::new(0),
+            fail_first_ack: true,
+            cancellations: AtomicUsize::new(0),
+        });
+        let mut replay_state = ChatState {
+            chat_id: Some("10000000-0000-4000-8000-000000000001".into()),
+            output_id: Some("20000000-0000-4000-8000-000000000002".into()),
+            pending_action: Some(crate::domain::services::chat::PendingOutputAction {
+                request: replay_request.clone(),
+                receipt: replay_api.receipt("pending"),
+                preimage: crate::domain::services::tools::prepare_action(&replay_request).unwrap(),
+                completed_result: None,
+            }),
+            ..Default::default()
+        };
+        let session_id = "40000000-0000-4000-8000-000000000004".to_owned();
+        let (command_tx, command_rx) = mpsc::channel();
+        let approval = RemoteEvent {
+            id: 20,
+            kind: RemoteEventKind::ApprovalAnswer,
+            payload: json!({"approval_id":"30000000-0000-4000-8000-000000000003","approved":true}),
+            created_at_ms: 20,
+        };
+        command_tx.send(approval).unwrap();
+        let replay_cursor = Arc::new(AtomicU64::new(0));
+        let (publish_tx, publish_rx) = mpsc::sync_channel(4);
+        let test_client = Arc::new(
+            CortexClient::new(Arc::new(crate::domain::models::native_auth::Session {
+                session_id: "test-session".into(),
+                csrf_token: "test-csrf".into(),
+            }))
+            .unwrap(),
+        );
+        let remote = RemoteSessionGuard {
+            api: test_client,
+            commands: replay_api.clone(),
+            registered: false,
+            session_id,
+            receiver: command_rx,
+            cursor: replay_cursor.clone(),
+            listener_online: Arc::new(AtomicBool::new(true)),
+            publisher: RemotePublisher {
+                sender: publish_tx,
+                failed: Arc::new(AtomicBool::new(false)),
+            },
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let mut controls = TurnControl {
+            active: true,
+            ..Default::default()
+        };
+        let mut queue = RemoteCommandQueue::default();
+        let mut action_worker = ActionWorker::default();
+        let mut surface = Surface::new(80, 24, false);
+        let mut screen = Vec::new();
+        queue
+            .poll(
+                &remote,
+                &mut replay_state,
+                &mut controls,
+                &mut action_worker,
+                &mut screen,
+                &mut surface,
+            )
+            .unwrap();
+        assert_eq!(
+            replay_cursor.load(Ordering::Relaxed),
+            0,
+            "failed ACK keeps the approval command queued"
+        );
+        assert_eq!(replay_api.claims.load(Ordering::SeqCst), 1);
+        assert!(
+            action_worker.result.is_some(),
+            "first approval starts the local worker"
+        );
+        queue.retry_at = Instant::now();
+        queue
+            .poll(
+                &remote,
+                &mut replay_state,
+                &mut controls,
+                &mut action_worker,
+                &mut screen,
+                &mut surface,
+            )
+            .unwrap();
+        assert_eq!(
+            replay_cursor.load(Ordering::Relaxed),
+            20,
+            "replayed answer is acknowledged"
+        );
+        assert_eq!(
+            replay_api.claims.load(Ordering::SeqCst),
+            1,
+            "replay never claims or starts a second effect"
+        );
+        assert_eq!(replay_api.acknowledgements.load(Ordering::SeqCst), 2);
+        command_tx
+            .send(RemoteEvent {
+                id: 21,
+                kind: RemoteEventKind::Cancel,
+                payload: json!({}),
+                created_at_ms: 21,
+            })
+            .unwrap();
+        queue.retry_at = Instant::now();
+        queue
+            .poll(
+                &remote,
+                &mut replay_state,
+                &mut controls,
+                &mut action_worker,
+                &mut screen,
+                &mut surface,
+            )
+            .unwrap();
+        assert_eq!(replay_cursor.load(Ordering::Relaxed), 21);
+        assert_eq!(replay_api.cancellations.load(Ordering::SeqCst), 1);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while replay_state.pending_action.is_some() && Instant::now() < deadline {
+            poll_action_worker(
+                replay_api.as_ref(),
+                &mut replay_state,
+                &mut action_worker,
+                Some(&remote.publisher),
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            replay_state.pending_action.is_none(),
+            "the cancelled worker reaches terminal stopped state"
+        );
+        assert!(
+            !cancel_marker.exists(),
+            "the post-sleep effect did not run after cancellation"
+        );
+        assert!(
+            matches!(publish_rx.try_recv(), Ok(PublishMessage::Event(RemoteEventKind::Progress, payload)) if payload["status"] == "cancelled" && payload["command_id"] == 21)
+        );
+        drop(remote);
+
         let ambiguous_marker = std::path::Path::new(".cache_ambiguous_claim_fixture");
         let _ = std::fs::remove_file(ambiguous_marker);
         let ambiguous_request = crate::domain::models::tools::ToolRequest::from_event(&json!({
@@ -1619,6 +1867,10 @@ mod tests {
             outputs: std::sync::Mutex::new(Vec::new()),
             claim_response_lost: true,
             claim_is_ambiguous: AtomicBool::new(false),
+            claims: AtomicUsize::new(0),
+            acknowledgements: AtomicUsize::new(0),
+            fail_first_ack: false,
+            cancellations: AtomicUsize::new(0),
         };
         let ambiguous_preimage =
             crate::domain::services::tools::prepare_action(&ambiguous_request).unwrap();
