@@ -6,5 +6,6 @@ pub mod chat;
 pub mod commands;
 pub mod formatters;
 pub mod handlers;
+pub mod providers;
 pub mod terminal;
 pub mod outputs {}

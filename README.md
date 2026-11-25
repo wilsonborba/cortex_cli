@@ -48,6 +48,41 @@ Asodya sign-in does not grant access to external provider subscriptions. There i
 no Asodya API-key login option. Native login must be enabled in the deployed
 gateway and auth application. Local contract tests do not verify that deployment.
 
+## External providers
+
+Use your own API key for a supported provider. This key is separate from the
+Asodya session. The CLI asks for the key without terminal echo and stores it in
+the OS keyring. It does not read keys from shell arguments, environment
+variables, or files.
+
+```sh
+cortex provider set openrouter
+cortex provider set openai
+cortex provider set anthropic
+cortex provider set gemini
+cortex provider list
+cortex provider remove openai
+cortex --print 'Explain this idea' --provider openai --model <model-id>
+```
+
+The provider name and model ID select a documented API-key request. The CLI
+does not sign in to another provider account, use another product's token, or
+register a provider account. Provider charges follow the user's provider terms.
+External provider mode currently sends one prompt and prints one complete text
+answer. It does not use the Asodya conversation history or tools.
+
+Use these provider API guides to create keys and select model IDs:
+
+- [OpenRouter API authentication](https://openrouter.ai/docs/api/reference/authentication)
+- [OpenAI API keys](https://platform.openai.com/api-keys)
+- [Anthropic API keys](https://console.anthropic.com/settings/keys)
+- [Gemini API keys](https://ai.google.dev/gemini-api/docs/api-key)
+
+The requests use the [OpenRouter chat API](https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion),
+[OpenAI chat API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
+[Anthropic Messages API](https://platform.claude.com/docs/en/api/messages/create),
+and [Gemini generateContent API](https://ai.google.dev/api/generate-content).
+
 ## Chat
 
 ```sh
