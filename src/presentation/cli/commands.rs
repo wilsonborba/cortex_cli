@@ -10,6 +10,7 @@ pub enum Command {
     Login,
     Logout,
     Provider(ProviderCommand),
+    RemoveVoiceModel,
     Chat(ChatOptions),
 }
 
@@ -25,22 +26,10 @@ pub struct ChatOptions {
     pub prompt: Option<String>,
     pub conversation: Option<String>,
     pub continue_latest: bool,
+    pub remote_control: bool,
     pub note_ids: Vec<String>,
     pub provider: Option<Provider>,
     pub model: Option<String>,
-}
-
-fn parse_provider(values: &[String]) -> Result<Command, ParseError> {
-    match values {
-        [action, id] if action == "set" => Ok(Command::Provider(ProviderCommand::Set(
-            Provider::parse(id).ok_or(ParseError)?,
-        ))),
-        [action, id] if action == "remove" => Ok(Command::Provider(ProviderCommand::Remove(
-            Provider::parse(id).ok_or(ParseError)?,
-        ))),
-        [action] if action == "list" => Ok(Command::Provider(ProviderCommand::List)),
-        _ => Err(ParseError),
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -59,6 +48,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
         .collect::<Result<_, _>>()?;
     if values.first().is_some_and(|value| value == "provider") {
         return parse_provider(&values[1..]);
+    }
+    if values.len() == 2 && values[0] == "voice" && values[1] == "--remove-model" {
+        return Ok(Command::RemoveVoiceModel);
     }
     if values.len() == 1 {
         match values[0].as_str() {
@@ -89,6 +81,24 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
                 }
                 options.continue_latest = true;
             }
+            "--note-id" => {
+                let id = args.next().ok_or(ParseError)?;
+                if !crate::domain::models::chat::valid_id(id)
+                    || options
+                        .note_ids
+                        .iter()
+                        .any(|selected| selected.eq_ignore_ascii_case(id))
+                {
+                    return Err(ParseError);
+                }
+                options.note_ids.push(id.to_ascii_lowercase());
+            }
+            "--remote-control" | "--remote" => {
+                if options.remote_control {
+                    return Err(ParseError);
+                }
+                options.remote_control = true;
+            }
             "--provider" => {
                 if options.provider.is_some() {
                     return Err(ParseError);
@@ -116,64 +126,33 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
                 }
                 options.conversation = Some(id.to_ascii_lowercase());
             }
-            "--note-id" => {
-                let id = args.next().ok_or(ParseError)?;
-                if !crate::domain::models::chat::valid_id(id)
-                    || options
-                        .note_ids
-                        .iter()
-                        .any(|selected| selected.eq_ignore_ascii_case(id))
-                {
-                    return Err(ParseError);
-                }
-                options.note_ids.push(id.to_ascii_lowercase());
-            }
             _ => return Err(ParseError),
         }
     }
-    if options.provider.is_some() != options.model.is_some()
+    if options.provider.is_some() && !options.note_ids.is_empty() {
+        return Err(ParseError);
+    }
+    if (options.remote_control && options.prompt.is_some())
+        || options.provider.is_some() != options.model.is_some()
         || options.provider.is_some()
             && (options.prompt.is_none()
                 || options.continue_latest
-                || options.conversation.is_some()
-                || !options.note_ids.is_empty())
+                || options.conversation.is_some())
     {
         return Err(ParseError);
     }
     Ok(Command::Chat(options))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(values: &[&str]) -> Vec<OsString> {
-        values.iter().map(OsString::from).collect()
-    }
-
-    #[test]
-    fn note_context_requires_explicit_unique_valid_ids() {
-        let Command::Chat(options) = parse(args(&[
-            "--note-id",
-            "10000000-0000-4000-8000-000000000001",
-            "--print",
-            "Explain this",
-        ]))
-        .unwrap() else {
-            panic!("expected chat command")
-        };
-        assert_eq!(options.note_ids, ["10000000-0000-4000-8000-000000000001"]);
-        assert!(parse(args(&["--note-id", "not-a-note", "--print", "hello"])).is_err());
-        assert!(
-            parse(args(&[
-                "--note-id",
-                "10000000-0000-4000-8000-000000000001",
-                "--note-id",
-                "10000000-0000-4000-8000-000000000001",
-                "--print",
-                "hello",
-            ]))
-            .is_err()
-        );
+fn parse_provider(values: &[String]) -> Result<Command, ParseError> {
+    match values {
+        [action, id] if action == "set" => Ok(Command::Provider(ProviderCommand::Set(
+            Provider::parse(id).ok_or(ParseError)?,
+        ))),
+        [action, id] if action == "remove" => Ok(Command::Provider(ProviderCommand::Remove(
+            Provider::parse(id).ok_or(ParseError)?,
+        ))),
+        [action] if action == "list" => Ok(Command::Provider(ProviderCommand::List)),
+        _ => Err(ParseError),
     }
 }

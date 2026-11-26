@@ -72,10 +72,18 @@ fn inline_frames_do_not_capture_mouse_or_use_alternate_screen() {
             true,
             Some(Duration::from_secs(1)),
             None,
+            None,
         )
         .unwrap();
     surface
-        .paint(&mut output, &state, false, None, Some(&Editor::default()))
+        .paint(
+            &mut output,
+            &state,
+            false,
+            None,
+            Some(&Editor::default()),
+            None,
+        )
         .unwrap();
     surface.clear(&mut output).unwrap();
     let text = String::from_utf8(output).unwrap();
@@ -100,6 +108,10 @@ fn mapped_flags_reject_extra_or_private_arguments_without_echo() {
     ));
     assert!(matches!(parse(args(&["-c"])), Ok(Command::Chat(_))));
     assert!(matches!(
+        parse(args(&["--remote-control"])),
+        Ok(Command::Chat(_))
+    ));
+    assert!(matches!(
         parse(args(&["provider", "set", "openai"])),
         Ok(Command::Provider(_))
     ));
@@ -119,6 +131,8 @@ fn mapped_flags_reject_extra_or_private_arguments_without_echo() {
         vec!["-r", "not-an-id"],
         vec!["--model", "private-value"],
         vec!["-p"],
+        vec!["-p", "hello", "--remote-control"],
+        vec!["--remote", "--remote-control"],
         vec!["provider", "set", "unknown"],
         vec!["-p", "hello", "--provider", "openai"],
         vec!["--provider", "openai", "--model", "sample"],

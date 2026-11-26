@@ -5,7 +5,7 @@ use crate::domain::models::chat::{ChatFailure, StreamEvent};
 const MAX_FRAME: usize = 256 * 1024;
 
 #[derive(Default)]
-pub struct SseDecoder {
+pub struct SseFrameDecoder {
     pending: Vec<u8>,
     name: String,
     id: Option<u64>,
@@ -13,8 +13,14 @@ pub struct SseDecoder {
     frame_bytes: usize,
 }
 
-impl SseDecoder {
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<StreamEvent>, ChatFailure> {
+pub struct SseFrame {
+    pub id: Option<u64>,
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+impl SseFrameDecoder {
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<SseFrame>, ChatFailure> {
         self.pending.extend_from_slice(bytes);
         let mut events = Vec::new();
         while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
@@ -32,11 +38,11 @@ impl SseDecoder {
                     if self.data.last() == Some(&b'\n') {
                         self.data.pop();
                     }
-                    events.push(StreamEvent::from_payload(
-                        self.id,
-                        self.name.clone(),
-                        &self.data,
-                    )?);
+                    events.push(SseFrame {
+                        id: self.id,
+                        name: self.name.clone(),
+                        data: std::mem::take(&mut self.data),
+                    });
                 }
                 self.name.clear();
                 self.data.clear();
@@ -82,5 +88,20 @@ impl SseDecoder {
             return Err(ChatFailure::InvalidResponse);
         }
         Ok(events)
+    }
+}
+
+#[derive(Default)]
+pub struct SseDecoder {
+    frames: SseFrameDecoder,
+}
+
+impl SseDecoder {
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<StreamEvent>, ChatFailure> {
+        self.frames
+            .feed(bytes)?
+            .into_iter()
+            .map(|frame| StreamEvent::from_payload(frame.id, frame.name, &frame.data))
+            .collect()
     }
 }

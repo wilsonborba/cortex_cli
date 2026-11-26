@@ -40,9 +40,10 @@ The installer is usable only after an owner-authorized release publishes the
 matching archive and `SHA256SUMS` file. It does not edit shell configuration or
 sign in to Asodya. Linux may need the system D-Bus runtime for Secret Service.
 
-Linux builds also need the D-Bus development package and `pkg-config`. Debian and
-Ubuntu provide these as `libdbus-1-dev` and `pkg-config`. macOS uses the OS
-Keychain. The HTTP and app-context adapters use Rust cryptography.
+Linux builds also need the D-Bus and ALSA development packages plus `pkg-config`.
+Debian and Ubuntu provide these as `libdbus-1-dev`, `libasound2-dev` and
+`pkg-config`. macOS uses the OS Keychain and CoreAudio. The HTTP and app-context
+adapters use Rust cryptography.
 
 ## Sign in
 
@@ -113,6 +114,7 @@ cortex
 cortex --print 'Explain this idea'
 cortex --continue
 cortex --conversation <chat-id>
+cortex --remote-control
 ```
 
 `-p`, `-c` and `-r` are the short forms. `--resume` also selects a chat by ID.
@@ -125,6 +127,14 @@ Elapsed time uses the clock. A recent average appears only when the server
 supplies one. Ctrl+D exits an empty prompt. Normal terminal selection and copy
 work without mouse capture or an alternate screen.
 
+`--remote-control` keeps the interactive CLI connected to the Cortex phone
+session while it runs. Prompts sent from the phone enter the same chat, and
+existing file IDs attached by the phone are passed through as references; the
+CLI does not upload local files. Progress and answer text are sent back to the
+phone. The CLI must remain open and signed in for remote control to work. A
+phone cancellation requests the same server cancellation as Ctrl+C. Phone
+approval responses are acknowledged in the terminal.
+
 Print mode writes answer text to stdout. Login prompts use stderr when needed.
 It does not add terminal colours to the answer. Set `NO_COLOR` to disable colour
 in the interactive client.
@@ -136,6 +146,21 @@ connection failure. Before acceptance, Ctrl+C disconnects; the remote request
 may continue. Resume a running conversation without a new prompt to replay and
 follow its output. No local commands or filesystem tools run from this chat
 client.
+
+Hold Space to dictate into the prompt, then edit the transcript before pressing
+Enter. Esc cancels recording. Audio is captured in memory and transcribed on the
+device; it is not written to disk or sent to a service. The multilingual
+`small-q5_1` model downloads on first voice use from the public whisper.cpp model
+repository and is SHA-256 checked before it is kept in the user cache. Remove it
+with `cortex voice --remove-model`.
+
+The CLI probes for Kitty keyboard press/release support. Kitty, Alacritty, foot,
+Ghostty, Rio and WezTerm with `enable_kitty_keyboard` enabled can use
+press/release detection, so recording starts after a short hold and stops on
+release. Other terminals use key-repeat detection: a short press inserts a
+space, holding starts recording when repeat events begin, and recording stops
+after repeat events pause. This fallback timing depends on the terminal and
+operating system keyboard repeat settings.
 
 ## Checks
 

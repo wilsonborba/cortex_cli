@@ -2,12 +2,29 @@
 
 use crate::{
     dal::remote::sse::SseDecoder,
-    domain::models::chat::{ChatFailure, ChatPage, ChatSummary, StreamEvent, valid_id},
+    domain::models::{
+        chat::{ChatFailure, ChatPage, ChatSummary, StreamEvent, valid_id},
+        tools::{OutputActionReceipt, ToolRequest, ToolResult},
+    },
 };
 use serde_json::Value;
 use std::io::Read;
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct BoundChildDetail {
+    pub child_id: String,
+    pub parent_chat_session_id: Option<String>,
+    pub parent_output_id: Option<String>,
+    pub parent_call_id: Option<String>,
+    pub child_chat_session_id: Option<String>,
+    pub child_output_id: Option<String>,
+    pub status: String,
+}
+
 pub trait ChatApi: Send + Sync {
+    fn upload_temporary_text(&self, _name: &str, _text: &str) -> Result<String, ChatFailure> {
+        Err(ChatFailure::SourceUnavailable)
+    }
     fn send(&self, chat: Option<&str>, text: &str) -> Result<Box<dyn Read + Send>, ChatFailure>;
     fn send_with_files(
         &self,
@@ -18,11 +35,86 @@ pub trait ChatApi: Send + Sync {
         if file_ids.is_empty() {
             self.send(chat, text)
         } else {
-            Err(ChatFailure::SourceUnavailable)
+            Err(ChatFailure::InvalidInput)
         }
     }
-    fn upload_temporary_text(&self, _name: &str, _text: &str) -> Result<String, ChatFailure> {
-        Err(ChatFailure::SourceUnavailable)
+    fn send_tools_with_files(
+        &self,
+        chat: Option<&str>,
+        text: &str,
+        file_ids: &[String],
+    ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        self.send_with_files(chat, text, file_ids)
+    }
+    fn submit_tool_result(
+        &self,
+        _chat: &str,
+        _output: &str,
+        _result: &ToolResult,
+    ) -> Result<(), ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn register_bound_child(
+        &self,
+        _remote_session: &str,
+        _chat: &str,
+        _output: &str,
+        _call_id: &str,
+    ) -> Result<String, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn bound_child_events(
+        &self,
+        _remote_session: &str,
+        _child_id: &str,
+        _after: u64,
+    ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn bound_child_detail(
+        &self,
+        _remote_session: &str,
+        _child_id: &str,
+    ) -> Result<BoundChildDetail, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn create_output_action(
+        &self,
+        _remote_session: &str,
+        _chat: &str,
+        _output: &str,
+        _request: &ToolRequest,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn get_output_action(
+        &self,
+        _remote_session: &str,
+        _chat: &str,
+        _output: &str,
+        _action_id: &str,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn answer_output_action(
+        &self,
+        _remote_session: &str,
+        _chat: &str,
+        _output: &str,
+        _action_id: &str,
+        _approved: bool,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn claim_output_action(
+        &self,
+        _remote_session: &str,
+        _chat: &str,
+        _output: &str,
+        _action_id: &str,
+        _request: &ToolRequest,
+    ) -> Result<OutputActionReceipt, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
     }
     fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure>;
     fn history(&self, id: &str) -> Result<ChatPage, ChatFailure>;
@@ -33,6 +125,14 @@ pub trait ChatApi: Send + Sync {
         after: u64,
     ) -> Result<Box<dyn Read + Send>, ChatFailure>;
     fn cancel(&self, chat: &str, output: &str) -> Result<(), ChatFailure>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingOutputAction {
+    pub request: ToolRequest,
+    pub receipt: OutputActionReceipt,
+    pub preimage: crate::domain::services::tools::ActionPreimage,
+    pub completed_result: Option<String>,
 }
 
 pub fn latest_chat(api: &impl ChatApi) -> Result<Option<String>, ChatFailure> {
@@ -94,6 +194,10 @@ pub struct ChatState {
     pub expected_ms: Option<u64>,
     pub complete: bool,
     pub total_ms: Option<u64>,
+    pub tool_request: Option<ToolRequest>,
+    pub pending_action: Option<PendingOutputAction>,
+    pub child_id: Option<String>,
+    pub child_call_id: Option<String>,
 }
 
 impl ChatState {
@@ -110,6 +214,12 @@ impl ChatState {
                     .as_str()
                     .ok_or(ChatFailure::InvalidResponse)?,
             ),
+            "tool_call" => {
+                if self.tool_request.is_some() {
+                    return Err(ChatFailure::InvalidResponse);
+                }
+                self.tool_request = Some(ToolRequest::from_event(&event.data)?);
+            }
             "stage" => {
                 if event.data["stage"] == "accept"
                     && event.data["status"] == "started"
