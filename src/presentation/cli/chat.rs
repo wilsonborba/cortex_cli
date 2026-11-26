@@ -1011,6 +1011,28 @@ fn parent_can_finish(parent_done_pending: bool, tracker: Option<&BoundChildTrack
     parent_done_pending && tracker.is_none_or(|tracker| tracker.terminal)
 }
 
+fn cleanup_finished_turn(
+    finish_pending: &mut bool,
+    finished: bool,
+    receiver: &mut Option<mpsc::Receiver<Result<StreamEvent, ChatFailure>>>,
+    child_tracker: &mut Option<BoundChildTracker>,
+    child_state: &mut Option<ChatState>,
+) -> bool {
+    *finish_pending |= finished;
+    if !*finish_pending
+        || child_tracker
+            .as_ref()
+            .is_some_and(|tracker| !tracker.terminal)
+    {
+        return false;
+    }
+    *finish_pending = false;
+    *receiver = None;
+    *child_tracker = None;
+    *child_state = None;
+    true
+}
+
 impl Drop for BoundChildTracker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -1809,6 +1831,7 @@ fn interactive<G: ChatApi + 'static>(
     let mut child_state: Option<ChatState> = None;
     let mut watched_child: Option<String> = None;
     let mut parent_done_pending = false;
+    let mut finish_pending = false;
     let mut started: Option<Instant> = None;
     let mut cleaner = TerminalText::default();
     let mut controls = TurnControl::default();
@@ -2206,11 +2229,14 @@ fn interactive<G: ChatApi + 'static>(
             if parent_can_finish(parent_done_pending, child_tracker.as_ref()) {
                 finished = true;
             }
-            if finished {
-                receiver = None;
+            if cleanup_finished_turn(
+                &mut finish_pending,
+                finished,
+                &mut receiver,
+                &mut child_tracker,
+                &mut child_state,
+            ) {
                 started = None;
-                child_tracker = None;
-                child_state = None;
                 parent_done_pending = false;
                 parent_pump = ParentEventPump::default();
                 controls.stop_requested = false;
@@ -3166,14 +3192,14 @@ mod tests {
             child_terminal: TestAtomicBool::new(false),
             detail_reads: AtomicUsize::new(0),
         });
-        let mut child_tracker = begin_bound_child_tracker(
+        let mut child_tracker = Some(begin_bound_child_tracker(
             api.clone(),
             REMOTE.into(),
             CHILD.into(),
             PARENT_CHAT.into(),
             PARENT_OUTPUT.into(),
             CALL.into(),
-        );
+        ));
         let deadline = Instant::now() + Duration::from_secs(2);
         while api.detail_reads.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
@@ -3183,19 +3209,21 @@ mod tests {
         // begin_turn exercises the actual spawn_turn -> follow path. The
         // accepted identity is read, then the fake transport drops and refuses
         // reconnect, producing the same parent Err(Connection) as production.
-        let receiver = begin_turn(
+        let mut receiver = Some(begin_turn(
             api.clone(),
             None,
             "parent fixture".into(),
             Vec::new(),
             None,
             None,
-        );
+        ));
         let mut parent_pump = ParentEventPump::default();
+        let mut child_state = Some(ChatState::default());
+        let mut finish_pending = false;
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut parent_error_received = false;
         while Instant::now() < deadline && !parent_error_received {
-            match parent_pump.poll(&receiver, true) {
+            match parent_pump.poll(receiver.as_ref().unwrap(), true) {
                 ParentEventPoll::Event(Err(ChatFailure::Connection)) => {
                     parent_error_received = true;
                     break;
@@ -3211,28 +3239,45 @@ mod tests {
         }
         assert!(parent_error_received);
         assert!(matches!(
-            parent_pump.fail(!child_tracker.terminal),
+            parent_pump.fail(true),
             ParentEventPoll::WaitingForChild
         ));
-        assert!(!child_tracker.terminal);
+        assert!(!child_tracker.as_ref().unwrap().terminal);
+        // Exercise the same cleanup seam used by the interactive loop after
+        // parent errors. The error is visible, but it cannot release the
+        // receiver, child recovery state, or block the next remote prompt.
+        assert!(!cleanup_finished_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+        ));
+        assert!(receiver.is_some());
+        assert!(child_tracker.is_some());
+        assert!(child_state.is_some());
+        assert!(finish_pending);
         assert!(matches!(
-            parent_pump.poll(&receiver, !child_tracker.terminal),
+            parent_pump.poll(receiver.as_ref().unwrap(), true),
             ParentEventPoll::WaitingForChild
         ));
 
         api.child_terminal.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && !child_tracker.terminal {
+        while Instant::now() < deadline && !child_tracker.as_ref().unwrap().terminal {
             match child_tracker
+                .as_ref()
+                .unwrap()
                 .receiver
                 .recv_timeout(Duration::from_millis(50))
             {
                 Ok(BoundChildMessage::ConfirmedTerminal(status)) => {
                     assert_eq!(status, "completed");
-                    child_tracker.terminal = true;
+                    child_tracker.as_mut().unwrap().terminal = true;
                 }
                 Ok(BoundChildMessage::Lifecycle(event)) => {
-                    child_tracker.terminal = observe_child_lifecycle(&mut child_tracker, &event);
+                    let tracker = child_tracker.as_mut().unwrap();
+                    tracker.terminal = observe_child_lifecycle(tracker, &event);
                 }
                 Ok(
                     BoundChildMessage::Error(_)
@@ -3243,11 +3288,22 @@ mod tests {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        assert!(child_tracker.terminal);
+        assert!(child_tracker.as_ref().unwrap().terminal);
         assert!(matches!(
-            parent_pump.poll(&receiver, !child_tracker.terminal),
+            parent_pump.poll(receiver.as_ref().unwrap(), false),
             ParentEventPoll::Failed
         ));
+        assert!(cleanup_finished_turn(
+            &mut finish_pending,
+            false,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+        ));
+        assert!(receiver.is_none());
+        assert!(child_tracker.is_none());
+        assert!(child_state.is_none());
+        assert!(!finish_pending);
     }
 
     #[test]
