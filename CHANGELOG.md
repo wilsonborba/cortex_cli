@@ -20,6 +20,7 @@
 - Use accepted output identity for cancellation and reconnect
 - Merge inline terminal chat
 - Add phone control for interactive sessions
+- Share selected images as artifacts (#9)
 - Consume typed tool requests
 - Execute output-bound approved tool actions
 - Add external provider API key support
