@@ -114,6 +114,7 @@ cortex
 cortex --print 'Explain this idea'
 cortex --continue
 cortex --conversation <chat-id>
+cortex --remote-control
 ```
 
 `-p`, `-c` and `-r` are the short forms. `--resume` also selects a chat by ID.
@@ -125,6 +126,14 @@ send it. Ctrl+O expands or collapses real server activity for this session.
 Elapsed time uses the clock. A recent average appears only when the server
 supplies one. Ctrl+D exits an empty prompt. Normal terminal selection and copy
 work without mouse capture or an alternate screen.
+
+`--remote-control` keeps the interactive CLI connected to the Cortex phone
+session while it runs. Prompts sent from the phone enter the same chat, and
+existing file IDs attached by the phone are passed through as references; the
+CLI does not upload local files. Progress and answer text are sent back to the
+phone. The CLI must remain open and signed in for remote control to work. A
+phone cancellation requests the same server cancellation as Ctrl+C. Phone
+approval responses are acknowledged in the terminal.
 
 Print mode writes answer text to stdout. Login prompts use stderr when needed.
 It does not add terminal colours to the answer. Set `NO_COLOR` to disable colour

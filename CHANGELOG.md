@@ -12,6 +12,8 @@
 
 
 ### Features
+- Add phone remote control for interactive Cortex sessions
+- Prepare versioned CLI archives and checksum-verified Linux/macOS installation
 - Add native Asodya sign-in and OS keyring storage
 - Merge native Asodya sign-in
 - Add Cortex chat streaming and inline activity view
@@ -28,6 +30,8 @@
 
 
 ### Fixes
+- Report partial file action writes accurately
+- Reject non-executable release entries and clean failed installer/package staging
 - Discard invalid successful handoffs before session storage
 - Keep narrow terminal activity details readable
 - Correlate streamed results with the selected conversation
@@ -48,6 +52,7 @@
 
 
 ### Tests
+- Cover remote session routes, SSE decoding, cursors, and file references
 - Reject mismatched native handoff credentials in fixtures
 - Cover chat history scope and fractional timestamps
 - Verify terminal detail toggle states through real key input

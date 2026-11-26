@@ -14,5 +14,6 @@ pub mod remote {
     pub mod gateway;
     pub mod login_context;
     pub mod provider;
+    pub mod remote_sse;
     pub mod sse;
 }
