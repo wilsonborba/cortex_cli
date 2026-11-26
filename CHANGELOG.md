@@ -40,6 +40,7 @@
 
 
 ### Fixes
+- Normalize owner metadata in native CLI archives
 - Discard invalid successful handoffs before session storage
 - Keep narrow terminal activity details readable
 - Correlate streamed results with the selected conversation

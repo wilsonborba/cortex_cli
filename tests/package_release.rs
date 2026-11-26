@@ -125,3 +125,54 @@ fn failed_manifest_publish_removes_only_new_archive_and_preserves_existing_asset
             .starts_with(".cortex-package.")
     }));
 }
+
+#[test]
+fn package_archive_records_neutral_owner_metadata() {
+    let root = TestDir::new();
+    let output_dir = root.path().join("release-assets");
+    let binary = root.path().join("cortex");
+    make_executable(&binary, "#!/bin/sh\nprintf fixture\\n\n");
+
+    let result = Command::new("bash")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/package-release.sh"
+        ))
+        .args(["--version", "1.2.3", "--target", host_target(), "--binary"])
+        .arg(&binary)
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "packaging should succeed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let archive = output_dir.join(format!("cortex-v1.2.3-{}.tar.gz", host_target()));
+    let listing = Command::new("tar")
+        .args(["-tvzf"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(listing.status.success());
+    let listing = String::from_utf8(listing.stdout).unwrap();
+    let member = listing
+        .lines()
+        .find(|line| line.ends_with(" cortex"))
+        .expect("archive should contain the cortex executable");
+    assert!(member.starts_with('-'), "member should be a regular file");
+    let fields: Vec<_> = member.split_whitespace().collect();
+    let neutral_owner = fields
+        .windows(2)
+        .any(|pair| pair == ["0", "0"] || pair == ["root", "root"])
+        || fields
+            .iter()
+            .any(|field| *field == "0/0" || *field == "root/root");
+    assert!(
+        neutral_owner,
+        "archive owner must use neutral metadata, not the source file identity"
+    );
+}

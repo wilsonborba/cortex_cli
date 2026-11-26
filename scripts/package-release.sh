@@ -98,7 +98,14 @@ cleanup() {
 }
 trap cleanup EXIT
 cp "$BINARY" "$STAGE/cortex"
-tar -czf "$STAGE/$ASSET" -C "$STAGE" cortex
+# Do not let the local builder's account identity leak into the archive.
+TAR_VERSION="$(tar --version 2>/dev/null | head -n 1 || true)"
+if [[ "$TAR_VERSION" == *"GNU tar"* ]]; then
+  tar --numeric-owner --owner=0 --group=0 -czf "$STAGE/$ASSET" -C "$STAGE" cortex
+else
+  # bsdtar (including macOS tar) uses these options to write neutral IDs and names.
+  tar --uid 0 --gid 0 --numeric-owner -czf "$STAGE/$ASSET" -C "$STAGE" cortex
+fi
 
 if command -v sha256sum >/dev/null 2>&1; then
   DIGEST="$(sha256sum "$STAGE/$ASSET" | awk '{print $1}')"
