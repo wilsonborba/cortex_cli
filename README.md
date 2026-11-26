@@ -15,7 +15,30 @@ cortex --version
 ```
 
 Cargo installs `cortex` into its bin directory. Add that directory to your `PATH`.
-No account or provider credential is needed for these commands.
+No account or provider credential is needed for these commands. A versioned
+release installer is prepared in `scripts/install.sh`; it downloads only the
+requested Linux or macOS build and verifies its SHA-256 entry before installing.
+Preview the selected asset and destination without network access or writes:
+
+```sh
+scripts/install.sh --version 0.1.0 --dry-run
+```
+
+For each native release build, stage its executable and checksum entry without
+publishing anything:
+
+```sh
+scripts/package-release.sh --version 0.1.0 --target x86_64-unknown-linux-gnu \
+  --binary target/release/cortex --output-dir /path/to/release-staging --dry-run
+```
+
+Run once per target in the same staging directory after reviewing the output.
+The package script writes a one-file archive and appends its SHA-256 entry to
+`SHA256SUMS`; release upload and tagging remain owner-controlled.
+
+The installer is usable only after an owner-authorized release publishes the
+matching archive and `SHA256SUMS` file. It does not edit shell configuration or
+sign in to Asodya. Linux may need the system D-Bus runtime for Secret Service.
 
 Linux builds also need the D-Bus development package and `pkg-config`. Debian and
 Ubuntu provide these as `libdbus-1-dev` and `pkg-config`. macOS uses the OS
@@ -47,6 +70,41 @@ If the gateway does not confirm logout, credentials remain for an explicit retry
 Asodya sign-in does not grant access to external provider subscriptions. There is
 no Asodya API-key login option. Native login must be enabled in the deployed
 gateway and auth application. Local contract tests do not verify that deployment.
+
+## External providers
+
+Use your own API key for a supported provider. This key is separate from the
+Asodya session. The CLI asks for the key without terminal echo and stores it in
+the OS keyring. It does not read keys from shell arguments, environment
+variables, or files.
+
+```sh
+cortex provider set openrouter
+cortex provider set openai
+cortex provider set anthropic
+cortex provider set gemini
+cortex provider list
+cortex provider remove openai
+cortex --print 'Explain this idea' --provider openai --model <model-id>
+```
+
+The provider name and model ID select a documented API-key request. The CLI
+does not sign in to another provider account, use another product's token, or
+register a provider account. Provider charges follow the user's provider terms.
+External provider mode currently sends one prompt and prints one complete text
+answer. It does not use the Asodya conversation history or tools.
+
+Use these provider API guides to create keys and select model IDs:
+
+- [OpenRouter API authentication](https://openrouter.ai/docs/api/reference/authentication)
+- [OpenAI API keys](https://platform.openai.com/api-keys)
+- [Anthropic API keys](https://console.anthropic.com/settings/keys)
+- [Gemini API keys](https://ai.google.dev/gemini-api/docs/api-key)
+
+The requests use the [OpenRouter chat API](https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion),
+[OpenAI chat API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
+[Anthropic Messages API](https://platform.claude.com/docs/en/api/messages/create),
+and [Gemini generateContent API](https://ai.google.dev/api/generate-content).
 
 ## Chat
 

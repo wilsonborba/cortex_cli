@@ -16,6 +16,10 @@
 - Use accepted output identity for cancellation and reconnect
 - Merge inline terminal chat
 - Add explicit Annotations note selection
+- Add external provider API key support
+- Integrate reviewed external provider adapters
+- Add explicit consent-gated CLI usage tracking
+- Integrate explicit consent and fixed usage payloads
 
 
 ### Fixes

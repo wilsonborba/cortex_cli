@@ -1,5 +1,6 @@
 //! Command syntax only. Never echo unknown arguments, which can contain secrets.
 
+use crate::domain::models::provider::Provider;
 use std::ffi::OsString;
 
 #[derive(PartialEq, Eq)]
@@ -8,7 +9,15 @@ pub enum Command {
     Version,
     Login,
     Logout,
+    Provider(ProviderCommand),
     Chat(ChatOptions),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCommand {
+    Set(Provider),
+    Remove(Provider),
+    List,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -17,6 +26,21 @@ pub struct ChatOptions {
     pub conversation: Option<String>,
     pub continue_latest: bool,
     pub note_ids: Vec<String>,
+    pub provider: Option<Provider>,
+    pub model: Option<String>,
+}
+
+fn parse_provider(values: &[String]) -> Result<Command, ParseError> {
+    match values {
+        [action, id] if action == "set" => Ok(Command::Provider(ProviderCommand::Set(
+            Provider::parse(id).ok_or(ParseError)?,
+        ))),
+        [action, id] if action == "remove" => Ok(Command::Provider(ProviderCommand::Remove(
+            Provider::parse(id).ok_or(ParseError)?,
+        ))),
+        [action] if action == "list" => Ok(Command::Provider(ProviderCommand::List)),
+        _ => Err(ParseError),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +57,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
         .into_iter()
         .map(|s| s.into_string().map_err(|_| ParseError))
         .collect::<Result<_, _>>()?;
+    if values.first().is_some_and(|value| value == "provider") {
+        return parse_provider(&values[1..]);
+    }
     if values.len() == 1 {
         match values[0].as_str() {
             "--help" | "-h" => return Ok(Command::Help),
@@ -62,6 +89,23 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
                 }
                 options.continue_latest = true;
             }
+            "--provider" => {
+                if options.provider.is_some() {
+                    return Err(ParseError);
+                }
+                options.provider =
+                    Some(Provider::parse(args.next().ok_or(ParseError)?).ok_or(ParseError)?);
+            }
+            "--model" => {
+                if options.model.is_some() {
+                    return Err(ParseError);
+                }
+                let model = args.next().ok_or(ParseError)?;
+                if model.trim().is_empty() || model.contains(['\r', '\n']) {
+                    return Err(ParseError);
+                }
+                options.model = Some(model.clone());
+            }
             "--conversation" | "--resume" | "-r" => {
                 if options.continue_latest || options.conversation.is_some() {
                     return Err(ParseError);
@@ -86,6 +130,15 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
             }
             _ => return Err(ParseError),
         }
+    }
+    if options.provider.is_some() != options.model.is_some()
+        || options.provider.is_some()
+            && (options.prompt.is_none()
+                || options.continue_latest
+                || options.conversation.is_some()
+                || !options.note_ids.is_empty())
+    {
+        return Err(ParseError);
     }
     Ok(Command::Chat(options))
 }
