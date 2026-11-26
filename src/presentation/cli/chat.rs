@@ -3070,30 +3070,180 @@ mod tests {
 
     #[test]
     fn parent_receiver_error_keeps_child_tracking_until_terminal_confirmation() {
-        let (sender, receiver) = mpsc::channel();
-        sender.send(Err(ChatFailure::Connection)).unwrap();
-        drop(sender);
-        let (_child_sender, child_receiver) = mpsc::channel();
-        let mut child_tracker = BoundChildTracker {
-            receiver: child_receiver,
-            stop: Arc::new(AtomicBool::new(false)),
-            terminal: false,
-        };
-        let mut parent_pump = ParentEventPump::default();
+        use std::sync::atomic::{AtomicBool as TestAtomicBool, AtomicUsize};
 
-        assert!(matches!(
-            parent_pump.poll(&receiver, true),
-            ParentEventPoll::Event(Err(ChatFailure::Connection))
-        ));
-        // This is the same failure latch called by interactive() for both
-        // StreamEvent::Err and ChatState::apply errors.
+        const REMOTE: &str = "40000000-0000-4000-8000-000000000004";
+        const CHILD: &str = "50000000-0000-4000-8000-000000000005";
+        const PARENT_CHAT: &str = "10000000-0000-4000-8000-000000000001";
+        const PARENT_OUTPUT: &str = "20000000-0000-4000-8000-000000000002";
+        const CHILD_CHAT: &str = "60000000-0000-4000-8000-000000000006";
+        const CHILD_OUTPUT: &str = "70000000-0000-4000-8000-000000000007";
+        const CALL: &str = "30000000-0000-4000-8000-000000000003";
+
+        struct FailAfterFrame(Cursor<Vec<u8>>);
+        impl Read for FailAfterFrame {
+            fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+                if self.0.position() == self.0.get_ref().len() as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "fixture loss",
+                    ));
+                }
+                self.0.read(target)
+            }
+        }
+
+        struct ParentErrorApi {
+            child_terminal: TestAtomicBool,
+            detail_reads: AtomicUsize,
+        }
+        impl ChatApi for ParentErrorApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                let frame = format!(
+                    "id: 1\nevent: stage\ndata: {}\n\n",
+                    json!({
+                        "message": "accepted",
+                        "data": {
+                            "stage": "accept",
+                            "status": "started",
+                            "expected_ms": null,
+                            "session_id": PARENT_CHAT,
+                            "output_id": PARENT_OUTPUT
+                        }
+                    })
+                );
+                Ok(Box::new(FailAfterFrame(Cursor::new(frame.into_bytes()))))
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(&self, _: &str) -> Result<ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::Connection)
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+            fn bound_child_events(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Ok(Box::new(Cursor::new(Vec::<u8>::new())))
+            }
+            fn bound_child_detail(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<crate::domain::services::chat::BoundChildDetail, ChatFailure> {
+                self.detail_reads.fetch_add(1, Ordering::AcqRel);
+                Ok(crate::domain::services::chat::BoundChildDetail {
+                    child_id: CHILD.into(),
+                    parent_chat_session_id: Some(PARENT_CHAT.into()),
+                    parent_output_id: Some(PARENT_OUTPUT.into()),
+                    parent_call_id: Some(CALL.into()),
+                    child_chat_session_id: Some(CHILD_CHAT.into()),
+                    child_output_id: Some(CHILD_OUTPUT.into()),
+                    status: if self.child_terminal.load(Ordering::Acquire) {
+                        "completed"
+                    } else {
+                        "running"
+                    }
+                    .into(),
+                })
+            }
+        }
+
+        let api = Arc::new(ParentErrorApi {
+            child_terminal: TestAtomicBool::new(false),
+            detail_reads: AtomicUsize::new(0),
+        });
+        let mut child_tracker = begin_bound_child_tracker(
+            api.clone(),
+            REMOTE.into(),
+            CHILD.into(),
+            PARENT_CHAT.into(),
+            PARENT_OUTPUT.into(),
+            CALL.into(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while api.detail_reads.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(api.detail_reads.load(Ordering::Acquire) > 0);
+
+        // begin_turn exercises the actual spawn_turn -> follow path. The
+        // accepted identity is read, then the fake transport drops and refuses
+        // reconnect, producing the same parent Err(Connection) as production.
+        let receiver = begin_turn(
+            api.clone(),
+            None,
+            "parent fixture".into(),
+            Vec::new(),
+            None,
+            None,
+        );
+        let mut parent_pump = ParentEventPump::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut parent_error_received = false;
+        while Instant::now() < deadline && !parent_error_received {
+            match parent_pump.poll(&receiver, true) {
+                ParentEventPoll::Event(Err(ChatFailure::Connection)) => {
+                    parent_error_received = true;
+                    break;
+                }
+                ParentEventPoll::Event(Ok(_)) | ParentEventPoll::Empty => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                other => panic!(
+                    "expected actual parent transport error, got {}",
+                    poll_name(&other)
+                ),
+            }
+        }
+        assert!(parent_error_received);
         assert!(matches!(
             parent_pump.fail(!child_tracker.terminal),
             ParentEventPoll::WaitingForChild
         ));
         assert!(!child_tracker.terminal);
+        assert!(matches!(
+            parent_pump.poll(&receiver, !child_tracker.terminal),
+            ParentEventPoll::WaitingForChild
+        ));
 
-        child_tracker.terminal = true;
+        api.child_terminal.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !child_tracker.terminal {
+            match child_tracker
+                .receiver
+                .recv_timeout(Duration::from_millis(50))
+            {
+                Ok(BoundChildMessage::ConfirmedTerminal(status)) => {
+                    assert_eq!(status, "completed");
+                    child_tracker.terminal = true;
+                }
+                Ok(BoundChildMessage::Lifecycle(event)) => {
+                    child_tracker.terminal = observe_child_lifecycle(&mut child_tracker, &event);
+                }
+                Ok(
+                    BoundChildMessage::Error(_)
+                    | BoundChildMessage::Bound(_, _)
+                    | BoundChildMessage::Output(_),
+                )
+                | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(child_tracker.terminal);
         assert!(matches!(
             parent_pump.poll(&receiver, !child_tracker.terminal),
             ParentEventPoll::Failed
