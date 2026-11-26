@@ -41,7 +41,7 @@ use std::{
     collections::{HashSet, VecDeque},
     io::{self, IsTerminal, Read, Write},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -306,6 +306,191 @@ enum PublishMessage {
     Event(RemoteEventKind, Value),
     Flush(mpsc::SyncSender<()>),
     Stop,
+}
+
+#[derive(Clone)]
+struct RemoteTurnContext {
+    state: Arc<Mutex<RemoteTurnState>>,
+}
+
+#[derive(Clone)]
+struct RemoteTurnPublisher {
+    publisher: RemotePublisher,
+    context: Option<RemoteTurnContext>,
+}
+
+#[derive(Default)]
+struct RemoteTurnState {
+    turn_id: Option<String>,
+    outcome: Option<RemoteTurnOutcome>,
+    terminal_taken: bool,
+}
+
+enum RemoteTurnOutcome {
+    Complete {
+        session_id: Option<String>,
+        output_id: Option<String>,
+        total_ms: Option<u64>,
+    },
+    Error(String),
+    Incomplete(String),
+}
+
+impl RemoteTurnContext {
+    fn new(output_id: Option<&str>) -> Self {
+        let turn_id = output_id.filter(|id| valid_id(id)).map(str::to_owned);
+        Self {
+            state: Arc::new(Mutex::new(RemoteTurnState {
+                turn_id,
+                outcome: None,
+                terminal_taken: false,
+            })),
+        }
+    }
+
+    fn observe_event(&self, event: &StreamEvent) -> Option<String> {
+        let receipt = event.name == "stage"
+            && event.data["stage"] == "accept"
+            && event.data["status"] == "started";
+        let output = if receipt || event.name == "done" {
+            event.data["output_id"]
+                .as_str()
+                .filter(|id| valid_id(id))
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.turn_id.is_none() {
+            state.turn_id = output;
+        }
+        state.turn_id.clone()
+    }
+
+    fn set_turn_id(&self, output_id: Option<&str>) {
+        let Some(output_id) = output_id.filter(|id| valid_id(id)) else {
+            return;
+        };
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.turn_id.is_none() {
+            state.turn_id = Some(output_id.to_owned());
+        }
+    }
+
+    fn turn_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .turn_id
+            .clone()
+    }
+
+    fn record(&self, outcome: RemoteTurnOutcome) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.terminal_taken && state.outcome.is_none() {
+            state.outcome = Some(outcome);
+        }
+    }
+
+    fn ensure_terminal_outcome(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.terminal_taken && state.outcome.is_none() {
+            state.outcome = Some(RemoteTurnOutcome::Incomplete(
+                "The turn ended before a stream outcome was received.".into(),
+            ));
+        }
+    }
+
+    fn record_failure(&self, error: ChatFailure) {
+        let message = error.to_string();
+        match error {
+            ChatFailure::Connection | ChatFailure::IncompleteStream => {
+                self.record(RemoteTurnOutcome::Incomplete(message));
+            }
+            _ => self.record(RemoteTurnOutcome::Error(message)),
+        }
+    }
+
+    fn take_terminal(&self) -> Option<Value> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.terminal_taken {
+            return None;
+        }
+        let outcome = state.outcome.take()?;
+        state.terminal_taken = true;
+        let mut payload = match outcome {
+            RemoteTurnOutcome::Complete {
+                session_id,
+                output_id,
+                total_ms,
+            } => json!({
+                "status": "complete",
+                "session_id": session_id,
+                "output_id": output_id,
+                "total_ms": total_ms
+            }),
+            RemoteTurnOutcome::Error(message) => json!({
+                "status": "error",
+                "message": message
+            }),
+            RemoteTurnOutcome::Incomplete(message) => json!({
+                "status": "incomplete",
+                "message": message
+            }),
+        };
+        if let Some(turn_id) = state.turn_id.as_ref() {
+            payload["turn_id"] = json!(turn_id);
+        }
+        Some(payload)
+    }
+}
+
+fn publish_turn_event(
+    publisher: Option<&RemotePublisher>,
+    kind: RemoteEventKind,
+    mut payload: Value,
+    turn_id: Option<&str>,
+) {
+    let Some(publisher) = publisher else { return };
+    if let Some(turn_id) = turn_id.filter(|id| valid_id(id)) {
+        payload["turn_id"] = json!(turn_id);
+    }
+    publisher.publish(kind, payload);
+}
+
+fn publish_turn_terminal(publisher: Option<&RemotePublisher>, context: Option<&RemoteTurnContext>) {
+    let (Some(publisher), Some(context)) = (publisher, context) else {
+        return;
+    };
+    if let Some(payload) = context.take_terminal() {
+        publisher.publish(RemoteEventKind::TurnEnd, payload);
+    }
+}
+
+fn cleanup_remote_turn(
+    finish_pending: &mut bool,
+    finished: bool,
+    receiver: &mut Option<mpsc::Receiver<Result<StreamEvent, ChatFailure>>>,
+    child_tracker: &mut Option<BoundChildTracker>,
+    child_state: &mut Option<ChatState>,
+    publisher: Option<&RemotePublisher>,
+    context: Option<&RemoteTurnContext>,
+) -> bool {
+    if cleanup_finished_turn(
+        finish_pending,
+        finished,
+        receiver,
+        child_tracker,
+        child_state,
+    ) {
+        if let Some(context) = context {
+            context.ensure_terminal_outcome();
+        }
+        publish_turn_terminal(publisher, context);
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -654,8 +839,12 @@ fn remote_listener_with<F>(
     }
 }
 
-fn publish_chat_event(publisher: Option<&RemotePublisher>, event: &StreamEvent) {
-    let Some(publisher) = publisher else { return };
+fn publish_chat_event(
+    publisher: Option<&RemotePublisher>,
+    context: Option<&RemoteTurnContext>,
+    turn_id: Option<&str>,
+    event: &StreamEvent,
+) {
     match event.name.as_str() {
         "stage" => {
             let mut progress = json!({
@@ -667,7 +856,7 @@ fn publish_chat_event(publisher: Option<&RemotePublisher>, event: &StreamEvent) 
             if let Some(expected) = event.data.get("expected_ms") {
                 progress["expected_ms"] = expected.clone();
             }
-            publisher.publish(RemoteEventKind::Progress, progress);
+            publish_turn_event(publisher, RemoteEventKind::Progress, progress, turn_id);
         }
         "step" => {
             let mut progress = json!({
@@ -680,27 +869,99 @@ fn publish_chat_event(publisher: Option<&RemotePublisher>, event: &StreamEvent) 
                     progress[key] = value.clone();
                 }
             }
-            publisher.publish(RemoteEventKind::Progress, progress);
+            publish_turn_event(publisher, RemoteEventKind::Progress, progress, turn_id);
         }
-        "notice" => publisher.publish(
+        "notice" => publish_turn_event(
+            publisher,
             RemoteEventKind::Progress,
             json!({"event":"notice", "notice_number":event.data["notice_number"]}),
+            turn_id,
         ),
-        "error" => publisher.publish(
-            RemoteEventKind::TurnEnd,
-            json!({"status":"error", "error_number":event.data["error_number"]}),
-        ),
-        "done" => publisher.publish(
-            RemoteEventKind::TurnEnd,
-            json!({
-                "status":"complete",
-                "session_id":event.data["session_id"],
-                "output_id":event.data["output_id"],
-                "total_ms":event.data["total_ms"]
-            }),
-        ),
+        "error" => {
+            if let Some(context) = context {
+                context.record(RemoteTurnOutcome::Error(event.message.clone()));
+            }
+            publish_turn_event(
+                publisher,
+                RemoteEventKind::Progress,
+                json!({"stage":"parent_error","message":event.message}),
+                turn_id,
+            );
+        }
+        "done" => {
+            if let Some(context) = context {
+                context.record(RemoteTurnOutcome::Complete {
+                    session_id: event.data["session_id"].as_str().map(str::to_owned),
+                    output_id: event.data["output_id"].as_str().map(str::to_owned),
+                    total_ms: event.data["total_ms"].as_u64(),
+                });
+            }
+            publish_turn_event(
+                publisher,
+                RemoteEventKind::Progress,
+                json!({"stage":"parent_complete","message":"Parent output completed; confirming the bound child."}),
+                turn_id,
+            );
+        }
         _ => {}
     }
+}
+
+fn follow_remote_turn<G: ChatApi>(
+    api: &G,
+    stream: Box<dyn Read + Send>,
+    state: &mut ChatState,
+    publisher: Option<&RemotePublisher>,
+    context: Option<&RemoteTurnContext>,
+    mut on_event: impl FnMut(StreamEvent) -> Result<(), ChatFailure>,
+) -> Result<(), ChatFailure> {
+    let mut answer = String::new();
+    let result = follow(api, stream, state, |event| {
+        let turn_id = context.and_then(|context| context.observe_event(&event));
+        if event.name == "token" && publisher.is_some() {
+            answer.push_str(event.data["text"].as_str().unwrap_or(""));
+            if answer.len() >= 1024 {
+                publish_turn_event(
+                    publisher,
+                    RemoteEventKind::AnswerPart,
+                    json!({"text":std::mem::take(&mut answer)}),
+                    turn_id.as_deref(),
+                );
+            }
+        } else {
+            if !answer.is_empty() {
+                publish_turn_event(
+                    publisher,
+                    RemoteEventKind::AnswerPart,
+                    json!({"text":std::mem::take(&mut answer)}),
+                    turn_id.as_deref(),
+                );
+            }
+            publish_chat_event(publisher, context, turn_id.as_deref(), &event);
+        }
+        on_event(event)
+    });
+    if let Some(context) = context {
+        context.set_turn_id(state.output_id.as_deref());
+        if let Err(error) = result {
+            context.record_failure(error);
+            publish_turn_event(
+                publisher,
+                RemoteEventKind::Progress,
+                json!({"stage":"parent_error","message":error.to_string()}),
+                state.output_id.as_deref(),
+            );
+        }
+    }
+    if !answer.is_empty() {
+        publish_turn_event(
+            publisher,
+            RemoteEventKind::AnswerPart,
+            json!({"text":answer}),
+            context.and_then(RemoteTurnContext::turn_id).as_deref(),
+        );
+    }
+    result
 }
 
 fn spawn_turn<G: ChatApi + 'static>(
@@ -708,54 +969,29 @@ fn spawn_turn<G: ChatApi + 'static>(
     chat_id: Option<String>,
     prompt: String,
     file_ids: Vec<String>,
-    publisher: Option<RemotePublisher>,
+    remote_turn: Option<RemoteTurnPublisher>,
     telemetry: Option<Arc<Telemetry>>,
     sender: mpsc::Sender<Result<StreamEvent, ChatFailure>>,
 ) {
     thread::spawn(move || {
+        let publisher = remote_turn.as_ref().map(|turn| &turn.publisher);
+        let turn_context = remote_turn.as_ref().and_then(|turn| turn.context.as_ref());
         let mut state = ChatState {
             chat_id: chat_id.clone(),
             ..Default::default()
         };
-        let mut answer = String::new();
         let result = api
             .send_tools_with_files(chat_id.as_deref(), &prompt, &file_ids)
             .and_then(|stream| {
-                follow(api.as_ref(), stream, &mut state, |event| {
-                    if event.name == "token" && publisher.is_some() {
-                        answer.push_str(event.data["text"].as_str().unwrap_or(""));
-                        if answer.len() >= 1024
-                            && let Some(publisher) = publisher.as_ref()
-                        {
-                            publisher.publish(
-                                RemoteEventKind::AnswerPart,
-                                json!({"text":std::mem::take(&mut answer)}),
-                            );
-                        }
-                    } else {
-                        if !answer.is_empty()
-                            && let Some(publisher) = publisher.as_ref()
-                        {
-                            publisher.publish(
-                                RemoteEventKind::AnswerPart,
-                                json!({"text":std::mem::take(&mut answer)}),
-                            );
-                        }
-                        publish_chat_event(publisher.as_ref(), &event);
-                    }
-                    sender.send(Ok(event)).map_err(|_| ChatFailure::Connection)
-                })
+                follow_remote_turn(
+                    api.as_ref(),
+                    stream,
+                    &mut state,
+                    publisher,
+                    turn_context,
+                    |event| sender.send(Ok(event)).map_err(|_| ChatFailure::Connection),
+                )
             });
-        if !answer.is_empty()
-            && let Some(publisher) = publisher.as_ref()
-        {
-            publisher.publish(RemoteEventKind::AnswerPart, json!({"text":answer}));
-        }
-        if result.is_err()
-            && let Some(publisher) = publisher.as_ref()
-        {
-            publisher.publish(RemoteEventKind::TurnEnd, json!({"status":"incomplete"}));
-        }
         if let Some(telemetry) = telemetry {
             telemetry.chat_result(result);
         }
@@ -765,17 +1001,66 @@ fn spawn_turn<G: ChatApi + 'static>(
     });
 }
 
-fn begin_turn<G: ChatApi + 'static>(
+fn begin_turn_with_context<G: ChatApi + 'static>(
     api: Arc<G>,
     chat_id: Option<String>,
     prompt: String,
     file_ids: Vec<String>,
     publisher: Option<RemotePublisher>,
+    turn_context: Option<RemoteTurnContext>,
     telemetry: Option<Arc<Telemetry>>,
 ) -> mpsc::Receiver<Result<StreamEvent, ChatFailure>> {
     let (sender, receiver) = mpsc::channel();
-    spawn_turn(api, chat_id, prompt, file_ids, publisher, telemetry, sender);
+    spawn_turn(
+        api,
+        chat_id,
+        prompt,
+        file_ids,
+        publisher.map(|publisher| RemoteTurnPublisher {
+            publisher,
+            context: turn_context,
+        }),
+        telemetry,
+        sender,
+    );
     receiver
+}
+
+fn spawn_reconnect_turn<G: ChatApi + 'static>(
+    api: Arc<G>,
+    chat_id: String,
+    output_id: String,
+    publisher: Option<RemotePublisher>,
+    turn_context: Option<RemoteTurnContext>,
+    telemetry: Option<Arc<Telemetry>>,
+    sender: mpsc::Sender<Result<StreamEvent, ChatFailure>>,
+) {
+    thread::spawn(move || {
+        let mut state = ChatState {
+            chat_id: Some(chat_id.clone()),
+            output_id: Some(output_id.clone()),
+            ..Default::default()
+        };
+        if let Some(context) = turn_context.as_ref() {
+            context.set_turn_id(Some(&output_id));
+        }
+        let result = api.reconnect(&chat_id, &output_id, 0).and_then(|stream| {
+            follow_remote_turn(
+                api.as_ref(),
+                stream,
+                &mut state,
+                publisher.as_ref(),
+                turn_context.as_ref(),
+                |event| sender.send(Ok(event)).map_err(|_| ChatFailure::Connection),
+            )
+        });
+        if let Some(telemetry) = telemetry {
+            telemetry.chat_result(result);
+        }
+        if let Err(error) = result {
+            let _ = sender.send(Err(error));
+        }
+    });
 }
 
 enum BoundChildMessage {
@@ -1444,6 +1729,7 @@ fn poll_action_worker(
     api: &impl ChatApi,
     state: &mut ChatState,
     worker: &mut ActionWorker,
+    turn_id: Option<&str>,
     publisher: Option<&RemotePublisher>,
 ) {
     if state.pending_action.is_none() {
@@ -1460,9 +1746,11 @@ fn poll_action_worker(
                 if let (Some(command_id), Some(publisher)) =
                     (worker.cancel_command.take(), publisher)
                 {
-                    publisher.publish(
+                    publish_turn_event(
+                        Some(publisher),
                         RemoteEventKind::Progress,
                         json!({"status":"cancelled","command_id":command_id}),
+                        turn_id,
                     );
                 }
                 state.pending_action = None;
@@ -1874,6 +2162,9 @@ fn interactive<G: ChatApi + 'static>(
         output_id: running.clone(),
         ..Default::default()
     };
+    let mut active_remote_turn = remote_publisher
+        .as_ref()
+        .map(|_| RemoteTurnContext::new(running.as_deref()));
     let mut editor = Editor::default();
     let mut context_uploaded = context.text.is_empty();
     let mut expanded = false;
@@ -1903,49 +2194,15 @@ fn interactive<G: ChatApi + 'static>(
         receiver = Some(rx);
         parent_pump = ParentEventPump::default();
         started = Some(Instant::now());
-        let api = api.clone();
-        let publisher = remote_publisher.clone();
-        let telemetry = telemetry.clone();
-        thread::spawn(move || {
-            let mut state = ChatState {
-                chat_id: Some(chat_id.clone()),
-                output_id: Some(output_id.clone()),
-                ..Default::default()
-            };
-            let result = api.reconnect(&chat_id, &output_id, 0).and_then(|stream| {
-                let mut answer = String::new();
-                follow(api.as_ref(), stream, &mut state, |event| {
-                    if event.name == "token" && publisher.is_some() {
-                        answer.push_str(event.data["text"].as_str().unwrap_or(""));
-                        if answer.len() >= 1024
-                            && let Some(publisher) = publisher.as_ref()
-                        {
-                            publisher.publish(
-                                RemoteEventKind::AnswerPart,
-                                json!({"text":std::mem::take(&mut answer)}),
-                            );
-                        }
-                    } else {
-                        if !answer.is_empty()
-                            && let Some(publisher) = publisher.as_ref()
-                        {
-                            publisher.publish(
-                                RemoteEventKind::AnswerPart,
-                                json!({"text":std::mem::take(&mut answer)}),
-                            );
-                        }
-                        publish_chat_event(publisher.as_ref(), &event);
-                    }
-                    tx.send(Ok(event)).map_err(|_| ChatFailure::Connection)
-                })
-            });
-            if let Some(telemetry) = telemetry {
-                telemetry.chat_result(result);
-            }
-            if let Err(error) = result {
-                let _ = tx.send(Err(error));
-            }
-        });
+        spawn_reconnect_turn(
+            api.clone(),
+            chat_id,
+            output_id,
+            remote_publisher.clone(),
+            active_remote_turn.clone(),
+            telemetry.clone(),
+            tx,
+        );
     }
     loop {
         if let Some(remote) = remote.as_ref() {
@@ -1978,10 +2235,14 @@ fn interactive<G: ChatApi + 'static>(
                 dirty = true;
             }
         }
+        let active_turn_id = active_remote_turn
+            .as_ref()
+            .and_then(RemoteTurnContext::turn_id);
         poll_action_worker(
             api.as_ref(),
             &mut state,
             &mut action_worker,
+            active_turn_id.as_deref(),
             remote.as_ref().map(|remote| &remote.publisher),
         );
         if let Some(child_state) = child_state.as_mut() {
@@ -1989,6 +2250,7 @@ fn interactive<G: ChatApi + 'static>(
                 api.as_ref(),
                 child_state,
                 &mut action_worker,
+                active_turn_id.as_deref(),
                 remote.as_ref().map(|remote| &remote.publisher),
             );
         }
@@ -2154,12 +2416,25 @@ fn interactive<G: ChatApi + 'static>(
                     ParentEventPoll::Event(value) => value,
                     ParentEventPoll::Empty | ParentEventPoll::WaitingForChild => break,
                     ParentEventPoll::Failed => {
+                        if let Some(context) = active_remote_turn.as_ref() {
+                            context.record_failure(ChatFailure::IncompleteStream);
+                        }
                         finished = true;
                         break;
                     }
                     ParentEventPoll::Disconnected => {
                         if !state.complete {
-                            surface.text(out, &format!("\n{}\n", ChatFailure::IncompleteStream))?;
+                            let error = ChatFailure::IncompleteStream;
+                            surface.text(out, &format!("\n{error}\n"))?;
+                            if let Some(context) = active_remote_turn.as_ref() {
+                                context.record_failure(error);
+                                publish_turn_event(
+                                    remote.as_ref().map(|session| &session.publisher),
+                                    RemoteEventKind::Progress,
+                                    json!({"stage":"parent_error","message":error.to_string()}),
+                                    context.turn_id().as_deref(),
+                                );
+                            }
                             if matches!(parent_pump.fail(child_live), ParentEventPoll::Failed) {
                                 finished = true;
                             }
@@ -2257,6 +2532,15 @@ fn interactive<G: ChatApi + 'static>(
                         Ok(false) => {}
                         Err(error) => {
                             surface.text(out, &format!("\n{error}\n"))?;
+                            if let Some(context) = active_remote_turn.as_ref() {
+                                context.record_failure(error);
+                                publish_turn_event(
+                                    remote.as_ref().map(|session| &session.publisher),
+                                    RemoteEventKind::Progress,
+                                    json!({"stage":"parent_error","message":error.to_string()}),
+                                    context.turn_id().as_deref(),
+                                );
+                            }
                             let child_live = child_tracker
                                 .as_ref()
                                 .is_some_and(|tracker| !tracker.terminal);
@@ -2281,13 +2565,16 @@ fn interactive<G: ChatApi + 'static>(
             if parent_can_finish(parent_done_pending, child_tracker.as_ref()) {
                 finished = true;
             }
-            if cleanup_finished_turn(
+            if cleanup_remote_turn(
                 &mut finish_pending,
                 finished,
                 &mut receiver,
                 &mut child_tracker,
                 &mut child_state,
+                remote.as_ref().map(|session| &session.publisher),
+                active_remote_turn.as_ref(),
             ) {
+                active_remote_turn = None;
                 started = None;
                 parent_done_pending = false;
                 parent_pump = ParentEventPump::default();
@@ -2303,14 +2590,18 @@ fn interactive<G: ChatApi + 'static>(
                 chat_id: chat.clone(),
                 ..Default::default()
             };
+            active_remote_turn = remote_publisher
+                .as_ref()
+                .map(|_| RemoteTurnContext::new(None));
             cleaner = TerminalText::default();
             started = Some(Instant::now());
-            receiver = Some(begin_turn(
+            receiver = Some(begin_turn_with_context(
                 api.clone(),
                 chat.clone(),
                 prompt,
                 file_ids,
                 remote_publisher.clone(),
+                active_remote_turn.clone(),
                 telemetry.clone(),
             ));
             parent_pump = ParentEventPump::default();
@@ -2524,12 +2815,16 @@ fn interactive<G: ChatApi + 'static>(
                                 continue;
                             }
                         };
-                        receiver = Some(begin_turn(
+                        active_remote_turn = remote_publisher
+                            .as_ref()
+                            .map(|_| RemoteTurnContext::new(None));
+                        receiver = Some(begin_turn_with_context(
                             api.clone(),
                             chat.clone(),
                             text,
                             file_ids,
                             remote_publisher.clone(),
+                            active_remote_turn.clone(),
                             telemetry.clone(),
                         ));
                         parent_pump = ParentEventPump::default();
@@ -3160,6 +3455,565 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_remote_turns_keep_answer_and_terminal_ids_separate() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let publisher = RemotePublisher {
+            sender,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        for (turn_id, answer) in [
+            (
+                "20000000-0000-4000-8000-000000000002",
+                "answer for first turn",
+            ),
+            (
+                "70000000-0000-4000-8000-000000000007",
+                "answer for second turn",
+            ),
+        ] {
+            let context = RemoteTurnContext::new(None);
+            let receipt = StreamEvent {
+                id: Some(1),
+                name: "stage".into(),
+                message: "accepted".into(),
+                data: json!({
+                    "stage":"accept",
+                    "status":"started",
+                    "session_id":"10000000-0000-4000-8000-000000000001",
+                    "output_id":turn_id
+                }),
+            };
+            assert_eq!(context.observe_event(&receipt).as_deref(), Some(turn_id));
+            publish_turn_event(
+                Some(&publisher),
+                RemoteEventKind::AnswerPart,
+                json!({"text":answer}),
+                context.turn_id().as_deref(),
+            );
+            context.record(RemoteTurnOutcome::Complete {
+                session_id: receipt.data["session_id"].as_str().map(str::to_owned),
+                output_id: Some(turn_id.to_owned()),
+                total_ms: Some(25),
+            });
+            let mut finish_pending = false;
+            let mut no_receiver = None;
+            let mut no_child = None;
+            let mut no_child_state = None;
+            assert!(cleanup_remote_turn(
+                &mut finish_pending,
+                true,
+                &mut no_receiver,
+                &mut no_child,
+                &mut no_child_state,
+                Some(&publisher),
+                Some(&context),
+            ));
+        }
+
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            &events[0],
+            PublishMessage::Event(RemoteEventKind::AnswerPart, payload)
+                if payload["turn_id"] == "20000000-0000-4000-8000-000000000002"
+                    && payload["text"] == "answer for first turn"
+        ));
+        assert!(matches!(
+            &events[1],
+            PublishMessage::Event(RemoteEventKind::TurnEnd, payload)
+                if payload["turn_id"] == "20000000-0000-4000-8000-000000000002"
+                    && payload["status"] == "complete"
+        ));
+        assert!(matches!(
+            &events[2],
+            PublishMessage::Event(RemoteEventKind::AnswerPart, payload)
+                if payload["turn_id"] == "70000000-0000-4000-8000-000000000007"
+                    && payload["text"] == "answer for second turn"
+        ));
+        assert!(matches!(
+            &events[3],
+            PublishMessage::Event(RemoteEventKind::TurnEnd, payload)
+                if payload["turn_id"] == "70000000-0000-4000-8000-000000000007"
+                    && payload["status"] == "complete"
+        ));
+    }
+
+    #[test]
+    fn initial_reconnect_publishes_bound_answer_and_waits_for_cleanup() {
+        const CHAT: &str = "10000000-0000-4000-8000-000000000001";
+        const OUTPUT: &str = "20000000-0000-4000-8000-000000000002";
+
+        struct ResumeApi;
+        impl ChatApi for ResumeApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(&self, _: &str) -> Result<ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                chat: &str,
+                output: &str,
+                after: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                assert_eq!((chat, output, after), (CHAT, OUTPUT, 0));
+                let frames = [
+                    (
+                        1,
+                        "stage",
+                        json!({"stage":"answer","status":"started"}),
+                        "resuming",
+                    ),
+                    (2, "token", json!({"text":"resumed answer"}), "answer"),
+                    (
+                        3,
+                        "done",
+                        json!({"session_id":CHAT,"output_id":OUTPUT,"total_ms":80}),
+                        "complete",
+                    ),
+                ];
+                let bytes = frames
+                    .into_iter()
+                    .map(|(id, name, data, message)| {
+                        format!(
+                            "id: {id}\nevent: {name}\ndata: {}\n\n",
+                            json!({"message":message,"data":data})
+                        )
+                    })
+                    .collect::<String>()
+                    .into_bytes();
+                Ok(Box::new(Cursor::new(bytes)))
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+        }
+
+        let (publish_sender, publish_receiver) = mpsc::sync_channel(8);
+        let publisher = RemotePublisher {
+            sender: publish_sender,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let context = RemoteTurnContext::new(Some(OUTPUT));
+        let (sender, receiver) = mpsc::channel();
+        spawn_reconnect_turn(
+            Arc::new(ResumeApi),
+            CHAT.into(),
+            OUTPUT.into(),
+            Some(publisher.clone()),
+            Some(context.clone()),
+            None,
+            sender,
+        );
+        let mut saw_done = false;
+        while let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_secs(2)) {
+            saw_done |= event.name == "done";
+            if saw_done {
+                break;
+            }
+        }
+        assert!(saw_done);
+        let progress_and_answer =
+            std::iter::from_fn(|| publish_receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(progress_and_answer.iter().any(|message| matches!(
+            message,
+            PublishMessage::Event(RemoteEventKind::Progress, payload)
+                if payload["turn_id"] == OUTPUT
+        )));
+        assert!(progress_and_answer.iter().any(|message| matches!(
+            message,
+            PublishMessage::Event(RemoteEventKind::AnswerPart, payload)
+                if payload["turn_id"] == OUTPUT && payload["text"] == "resumed answer"
+        )));
+        assert!(
+            progress_and_answer.iter().all(|message| !matches!(
+                message,
+                PublishMessage::Event(RemoteEventKind::TurnEnd, _)
+            ))
+        );
+
+        let mut finish_pending = false;
+        let mut no_receiver = None;
+        let mut no_child = None;
+        let mut no_child_state = None;
+        assert!(cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut no_receiver,
+            &mut no_child,
+            &mut no_child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(matches!(
+            publish_receiver.try_recv(),
+            Ok(PublishMessage::Event(RemoteEventKind::TurnEnd, payload))
+                if payload["turn_id"] == OUTPUT && payload["status"] == "complete"
+        ));
+        assert!(publish_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn send_failure_before_stream_publishes_one_unbound_terminal_at_common_cleanup() {
+        struct SendErrorApi;
+        impl ChatApi for SendErrorApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::Connection)
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(&self, _: &str) -> Result<ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::Connection)
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+        }
+
+        let (publish_sender, publish_receiver) = mpsc::sync_channel(8);
+        let publisher = RemotePublisher {
+            sender: publish_sender,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let context = RemoteTurnContext::new(None);
+        let mut receiver = Some(begin_turn_with_context(
+            Arc::new(SendErrorApi),
+            None,
+            "unaccepted prompt".into(),
+            Vec::new(),
+            Some(publisher.clone()),
+            Some(context.clone()),
+            None,
+        ));
+        let mut parent_pump = ParentEventPump::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let failure = loop {
+            match parent_pump.poll(receiver.as_ref().unwrap(), false) {
+                ParentEventPoll::Event(Err(error)) => break error,
+                ParentEventPoll::Empty if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                other => panic!(
+                    "expected pre-stream send failure, got {}",
+                    poll_name(&other)
+                ),
+            }
+        };
+        assert_eq!(failure, ChatFailure::Connection);
+        assert!(matches!(parent_pump.fail(false), ParentEventPoll::Failed));
+        assert!(context.turn_id().is_none());
+
+        let mut finish_pending = false;
+        let mut child_tracker = None;
+        let mut child_state = None;
+        assert!(cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(receiver.is_none());
+        assert!(matches!(
+            publish_receiver.try_recv(),
+            Ok(PublishMessage::Event(RemoteEventKind::TurnEnd, payload))
+                if payload["status"] == "incomplete"
+                    && payload.get("turn_id").is_none()
+        ));
+        assert!(cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(
+            publish_receiver.try_recv().is_err(),
+            "terminal is emitted once"
+        );
+    }
+
+    #[test]
+    fn reconnect_failure_publishes_bound_incomplete_terminal_at_common_cleanup() {
+        const CHAT: &str = "10000000-0000-4000-8000-000000000001";
+        const OUTPUT: &str = "20000000-0000-4000-8000-000000000002";
+
+        struct ReconnectErrorApi;
+        impl ChatApi for ReconnectErrorApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(&self, _: &str) -> Result<ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::Connection)
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+        }
+
+        let (publish_sender, publish_receiver) = mpsc::sync_channel(8);
+        let publisher = RemotePublisher {
+            sender: publish_sender,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let context = RemoteTurnContext::new(Some(OUTPUT));
+        let (sender, receiver) = mpsc::channel();
+        spawn_reconnect_turn(
+            Arc::new(ReconnectErrorApi),
+            CHAT.into(),
+            OUTPUT.into(),
+            Some(publisher.clone()),
+            Some(context.clone()),
+            None,
+            sender,
+        );
+        let mut receiver = Some(receiver);
+        let mut parent_pump = ParentEventPump::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match parent_pump.poll(receiver.as_ref().unwrap(), false) {
+                ParentEventPoll::Event(Err(ChatFailure::Connection)) => break,
+                ParentEventPoll::Empty if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                other => panic!("expected reconnect failure, got {}", poll_name(&other)),
+            }
+        }
+        assert!(matches!(parent_pump.fail(false), ParentEventPoll::Failed));
+        assert_eq!(context.turn_id().as_deref(), Some(OUTPUT));
+
+        let mut finish_pending = false;
+        let mut child_tracker = None;
+        let mut child_state = None;
+        assert!(cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(receiver.is_none());
+        assert!(matches!(
+            publish_receiver.try_recv(),
+            Ok(PublishMessage::Event(RemoteEventKind::TurnEnd, payload))
+                if payload["turn_id"] == OUTPUT && payload["status"] == "incomplete"
+        ));
+        assert!(publish_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn tool_result_submit_failure_waits_for_live_child_before_fallback_terminal() {
+        use std::sync::atomic::{AtomicBool as TestAtomicBool, AtomicUsize};
+
+        const REMOTE: &str = "40000000-0000-4000-8000-000000000004";
+        const CHILD: &str = "50000000-0000-4000-8000-000000000005";
+        const CHAT: &str = "10000000-0000-4000-8000-000000000001";
+        const OUTPUT: &str = "20000000-0000-4000-8000-000000000002";
+        const CHILD_CHAT: &str = "60000000-0000-4000-8000-000000000006";
+        const CHILD_OUTPUT: &str = "70000000-0000-4000-8000-000000000007";
+        const CALL: &str = "30000000-0000-4000-8000-000000000003";
+
+        struct LiveChildApi {
+            terminal: TestAtomicBool,
+            detail_reads: AtomicUsize,
+        }
+        impl ChatApi for LiveChildApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(&self, _: &str) -> Result<ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+            fn bound_child_events(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Ok(Box::new(Cursor::new(Vec::<u8>::new())))
+            }
+            fn bound_child_detail(
+                &self,
+                _: &str,
+                child: &str,
+            ) -> Result<crate::domain::services::chat::BoundChildDetail, ChatFailure> {
+                self.detail_reads.fetch_add(1, Ordering::AcqRel);
+                Ok(crate::domain::services::chat::BoundChildDetail {
+                    child_id: child.into(),
+                    parent_chat_session_id: Some(CHAT.into()),
+                    parent_output_id: Some(OUTPUT.into()),
+                    parent_call_id: Some(CALL.into()),
+                    child_chat_session_id: Some(CHILD_CHAT.into()),
+                    child_output_id: Some(CHILD_OUTPUT.into()),
+                    status: if self.terminal.load(Ordering::Acquire) {
+                        "completed"
+                    } else {
+                        "running"
+                    }
+                    .into(),
+                })
+            }
+        }
+
+        let api = Arc::new(LiveChildApi {
+            terminal: TestAtomicBool::new(false),
+            detail_reads: AtomicUsize::new(0),
+        });
+        let mut child_tracker = Some(begin_bound_child_tracker(
+            api.clone(),
+            REMOTE.into(),
+            CHILD.into(),
+            CHAT.into(),
+            OUTPUT.into(),
+            CALL.into(),
+        ));
+        let detail_deadline = Instant::now() + Duration::from_secs(2);
+        while api.detail_reads.load(Ordering::Acquire) == 0 && Instant::now() < detail_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(api.detail_reads.load(Ordering::Acquire) > 0);
+
+        let request = crate::domain::models::tools::ToolRequest::from_event(&json!({
+            "call_id":"30000000-0000-4000-8000-000000000009",
+            "name":"view_file",
+            "arguments":{"path":"Cargo.toml","start_line":1}
+        }))
+        .unwrap();
+        let mut state = ChatState {
+            chat_id: Some(CHAT.into()),
+            output_id: Some(OUTPUT.into()),
+            child_id: Some(CHILD.into()),
+            child_call_id: Some(CALL.into()),
+            tool_request: Some(request),
+            ..Default::default()
+        };
+        assert!(submit_tool_call(api.as_ref(), &mut state, Some(REMOTE), true).is_err());
+
+        let (publish_sender, publish_receiver) = mpsc::sync_channel(8);
+        let publisher = RemotePublisher {
+            sender: publish_sender,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let context = RemoteTurnContext::new(Some(OUTPUT));
+        let (parent_sender, parent_receiver) = mpsc::channel();
+        drop(parent_sender);
+        let mut receiver = Some(parent_receiver);
+        let mut parent_pump = ParentEventPump::default();
+        assert!(matches!(
+            parent_pump.fail(true),
+            ParentEventPoll::WaitingForChild
+        ));
+        let mut finish_pending = false;
+        let mut child_state = Some(ChatState::default());
+        assert!(!cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(receiver.is_some());
+        assert!(child_tracker.is_some());
+        assert!(publish_receiver.try_recv().is_err());
+
+        api.terminal.store(true, Ordering::Release);
+        let terminal_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < terminal_deadline && !child_tracker.as_ref().unwrap().terminal {
+            match child_tracker
+                .as_ref()
+                .unwrap()
+                .receiver
+                .recv_timeout(Duration::from_millis(50))
+            {
+                Ok(BoundChildMessage::ConfirmedTerminal(status)) => {
+                    assert_eq!(status, "completed");
+                    child_tracker.as_mut().unwrap().terminal = true;
+                }
+                Ok(BoundChildMessage::Lifecycle(event)) => {
+                    let tracker = child_tracker.as_mut().unwrap();
+                    tracker.terminal = observe_child_lifecycle(tracker, &event);
+                }
+                Ok(
+                    BoundChildMessage::Error(_)
+                    | BoundChildMessage::Bound(_, _)
+                    | BoundChildMessage::Output(_),
+                )
+                | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(child_tracker.as_ref().unwrap().terminal);
+        assert!(matches!(parent_pump.fail(false), ParentEventPoll::Failed));
+        assert!(cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(receiver.is_none());
+        assert!(child_tracker.is_none());
+        assert!(child_state.is_none());
+        assert!(matches!(
+            publish_receiver.try_recv(),
+            Ok(PublishMessage::Event(RemoteEventKind::TurnEnd, payload))
+                if payload["turn_id"] == OUTPUT && payload["status"] == "incomplete"
+        ));
+        assert!(
+            publish_receiver.try_recv().is_err(),
+            "terminal is emitted once"
+        );
+    }
+
+    #[test]
     fn parent_receiver_error_keeps_child_tracking_until_terminal_confirmation() {
         use std::sync::atomic::{AtomicBool as TestAtomicBool, AtomicUsize};
 
@@ -3274,12 +4128,19 @@ mod tests {
         // begin_turn exercises the actual spawn_turn -> follow path. The
         // accepted identity is read, then the fake transport drops and refuses
         // reconnect, producing the same parent Err(Connection) as production.
-        let mut receiver = Some(begin_turn(
+        let (publish_sender, publish_receiver) = mpsc::sync_channel(16);
+        let publisher = RemotePublisher {
+            sender: publish_sender,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let turn_context = RemoteTurnContext::new(None);
+        let mut receiver = Some(begin_turn_with_context(
             api.clone(),
             None,
             "parent fixture".into(),
             Vec::new(),
-            None,
+            Some(publisher.clone()),
+            Some(turn_context.clone()),
             None,
         ));
         let mut parent_pump = ParentEventPump::default();
@@ -3308,15 +4169,31 @@ mod tests {
             ParentEventPoll::WaitingForChild
         ));
         assert!(!child_tracker.as_ref().unwrap().terminal);
+        assert_eq!(turn_context.turn_id().as_deref(), Some(PARENT_OUTPUT));
+        let early_events =
+            std::iter::from_fn(|| publish_receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(early_events.iter().any(|message| matches!(
+            message,
+            PublishMessage::Event(RemoteEventKind::Progress, payload)
+                if payload["turn_id"] == PARENT_OUTPUT && payload["stage"] == "parent_error"
+        )));
+        assert!(
+            early_events.iter().all(|message| !matches!(
+                message,
+                PublishMessage::Event(RemoteEventKind::TurnEnd, _)
+            ))
+        );
         // Exercise the same cleanup seam used by the interactive loop after
         // parent errors. The error is visible, but it cannot release the
         // receiver, child recovery state, or block the next remote prompt.
-        assert!(!cleanup_finished_turn(
+        assert!(!cleanup_remote_turn(
             &mut finish_pending,
             true,
             &mut receiver,
             &mut child_tracker,
             &mut child_state,
+            Some(&publisher),
+            Some(&turn_context),
         ));
         assert!(receiver.is_some());
         assert!(child_tracker.is_some());
@@ -3326,6 +4203,7 @@ mod tests {
             parent_pump.poll(receiver.as_ref().unwrap(), true),
             ParentEventPoll::WaitingForChild
         ));
+        assert!(publish_receiver.try_recv().is_err());
 
         api.child_terminal.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -3358,17 +4236,29 @@ mod tests {
             parent_pump.poll(receiver.as_ref().unwrap(), false),
             ParentEventPoll::Failed
         ));
-        assert!(cleanup_finished_turn(
+        assert!(cleanup_remote_turn(
             &mut finish_pending,
             false,
             &mut receiver,
             &mut child_tracker,
             &mut child_state,
+            Some(&publisher),
+            Some(&turn_context),
         ));
         assert!(receiver.is_none());
         assert!(child_tracker.is_none());
         assert!(child_state.is_none());
         assert!(!finish_pending);
+        assert!(matches!(
+            publish_receiver.try_recv(),
+            Ok(PublishMessage::Event(RemoteEventKind::TurnEnd, payload))
+                if payload["turn_id"] == PARENT_OUTPUT
+                    && payload["status"] == "incomplete"
+        ));
+        assert!(
+            publish_receiver.try_recv().is_err(),
+            "terminal is emitted once"
+        );
     }
 
     #[test]
@@ -3695,7 +4585,7 @@ mod tests {
         );
         let deadline = Instant::now() + Duration::from_secs(4);
         while state.pending_action.is_some() && Instant::now() < deadline {
-            poll_action_worker(&api, &mut state, &mut worker, None);
+            poll_action_worker(&api, &mut state, &mut worker, None, None);
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
@@ -3850,6 +4740,7 @@ mod tests {
                 replay_api.as_ref(),
                 &mut replay_state,
                 &mut action_worker,
+                None,
                 Some(&remote.publisher),
             );
             thread::sleep(Duration::from_millis(20));
