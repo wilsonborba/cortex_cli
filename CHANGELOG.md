@@ -10,6 +10,7 @@
 
 
 ### Features
+- Add local hold-to-talk input (#10)
 - Prepare versioned CLI archives and checksum-verified Linux/macOS installation
 - Add native Asodya sign-in and OS keyring storage
 - Merge native Asodya sign-in
