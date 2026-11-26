@@ -72,10 +72,18 @@ fn inline_frames_do_not_capture_mouse_or_use_alternate_screen() {
             true,
             Some(Duration::from_secs(1)),
             None,
+            None,
         )
         .unwrap();
     surface
-        .paint(&mut output, &state, false, None, Some(&Editor::default()))
+        .paint(
+            &mut output,
+            &state,
+            false,
+            None,
+            Some(&Editor::default()),
+            None,
+        )
         .unwrap();
     surface.clear(&mut output).unwrap();
     let text = String::from_utf8(output).unwrap();

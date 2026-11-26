@@ -7,6 +7,8 @@
 - Clarify public macOS build instructions
 - Merge bootstrap review corrections
 - Update terminal chat changelog
+- Record provider safety and explicit telemetry consent
+- Record verified CLI release preparation
 
 
 ### Features
@@ -17,10 +19,14 @@
 - Add Cortex chat streaming and inline activity view
 - Use accepted output identity for cancellation and reconnect
 - Merge inline terminal chat
+- Add local hold-to-talk input (#10)
 - Add external provider API key support
 - Integrate reviewed external provider adapters
 - Add explicit consent-gated CLI usage tracking
 - Integrate explicit consent and fixed usage payloads
+- Prepare checksum-verified release tooling
+- Prepare verified CLI installation artifacts
+- Integrate reviewed local speech input (#10)
 
 
 ### Fixes
@@ -30,7 +36,12 @@
 - Keep narrow terminal activity details readable
 - Correlate streamed results with the selected conversation
 - Keep terminal title readable on light backgrounds
+- Stop voice capture and cancel transcription
+- Discard transcript after accepted cancellation
 - Bound and sanitize provider responses
+- Reject unsafe release archives
+- Clean archive after manifest publish failure
+- Stop fallback voice recording after pause
 
 
 ### Maintenance
@@ -45,6 +56,11 @@
 - Reject mismatched native handoff credentials in fixtures
 - Cover chat history scope and fractional timestamps
 - Verify terminal detail toggle states through real key input
+- Cover local cancellation and transcript privacy
+
+
+### merge
+- Refresh voice input from accepted feature base
 
 
 ### refactor

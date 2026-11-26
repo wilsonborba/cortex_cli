@@ -10,6 +10,7 @@ pub enum Command {
     Login,
     Logout,
     Provider(ProviderCommand),
+    RemoveVoiceModel,
     Chat(ChatOptions),
 }
 
@@ -46,6 +47,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
         .collect::<Result<_, _>>()?;
     if values.first().is_some_and(|value| value == "provider") {
         return parse_provider(&values[1..]);
+    }
+    if values.len() == 2 && values[0] == "voice" && values[1] == "--remove-model" {
+        return Ok(Command::RemoveVoiceModel);
     }
     if values.len() == 1 {
         match values[0].as_str() {

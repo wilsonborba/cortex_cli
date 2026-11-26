@@ -40,9 +40,10 @@ The installer is usable only after an owner-authorized release publishes the
 matching archive and `SHA256SUMS` file. It does not edit shell configuration or
 sign in to Asodya. Linux may need the system D-Bus runtime for Secret Service.
 
-Linux builds also need the D-Bus development package and `pkg-config`. Debian and
-Ubuntu provide these as `libdbus-1-dev` and `pkg-config`. macOS uses the OS
-Keychain. The HTTP and app-context adapters use Rust cryptography.
+Linux builds also need the D-Bus and ALSA development packages plus `pkg-config`.
+Debian and Ubuntu provide these as `libdbus-1-dev`, `libasound2-dev` and
+`pkg-config`. macOS uses the OS Keychain and CoreAudio. The HTTP and app-context
+adapters use Rust cryptography.
 
 ## Sign in
 
@@ -145,6 +146,21 @@ connection failure. Before acceptance, Ctrl+C disconnects; the remote request
 may continue. Resume a running conversation without a new prompt to replay and
 follow its output. No local commands or filesystem tools run from this chat
 client.
+
+Hold Space to dictate into the prompt, then edit the transcript before pressing
+Enter. Esc cancels recording. Audio is captured in memory and transcribed on the
+device; it is not written to disk or sent to a service. The multilingual
+`small-q5_1` model downloads on first voice use from the public whisper.cpp model
+repository and is SHA-256 checked before it is kept in the user cache. Remove it
+with `cortex voice --remove-model`.
+
+The CLI probes for Kitty keyboard press/release support. Kitty, Alacritty, foot,
+Ghostty, Rio and WezTerm with `enable_kitty_keyboard` enabled can use
+press/release detection, so recording starts after a short hold and stops on
+release. Other terminals use key-repeat detection: a short press inserts a
+space, holding starts recording when repeat events begin, and recording stops
+after repeat events pause. This fallback timing depends on the terminal and
+operating system keyboard repeat settings.
 
 ## Checks
 

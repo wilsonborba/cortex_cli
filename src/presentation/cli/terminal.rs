@@ -3,7 +3,10 @@
 use crate::{core::terminal_text::clean, domain::services::chat::ChatState};
 use crossterm::{
     cursor::{MoveToColumn, MoveUp, Show},
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute, queue,
     style::{Color, ResetColor, SetForegroundColor},
     terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
@@ -14,19 +17,48 @@ use std::{
 };
 use unicode_width::UnicodeWidthStr;
 
-pub struct RawTerminal;
+pub struct RawTerminal {
+    keyboard_enhancement: bool,
+}
 impl RawTerminal {
     pub fn enter(output: &mut impl Write) -> io::Result<Self> {
         enable_raw_mode()?;
-        let guard = Self;
+        let keyboard_enhancement =
+            crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let guard = Self {
+            keyboard_enhancement,
+        };
         execute!(output, EnableBracketedPaste)?;
+        if keyboard_enhancement {
+            execute!(
+                output,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )?;
+        }
         Ok(guard)
+    }
+
+    pub fn reports_key_releases(&self) -> bool {
+        self.keyboard_enhancement
     }
 }
 impl Drop for RawTerminal {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, Show, ResetColor);
+        if self.keyboard_enhancement {
+            let _ = execute!(
+                io::stdout(),
+                PopKeyboardEnhancementFlags,
+                DisableBracketedPaste,
+                Show,
+                ResetColor
+            );
+        } else {
+            let _ = execute!(io::stdout(), DisableBracketedPaste, Show, ResetColor);
+        }
     }
 }
 
@@ -249,6 +281,7 @@ impl Surface {
         expanded: bool,
         elapsed: Option<Duration>,
         editor: Option<&Editor>,
+        voice_status: Option<&str>,
     ) -> io::Result<()> {
         self.clear(out)?;
         let mut lines = activity_lines(state, expanded, elapsed, self.height);
@@ -269,6 +302,9 @@ impl Surface {
             lines.push(footer);
         }
         let input = editor.map(|e| editor_view(e, self.columns));
+        if let Some(status) = voice_status {
+            lines.push(status.to_owned());
+        }
         if let Some((line, _)) = &input {
             lines.push(line.clone());
         }
