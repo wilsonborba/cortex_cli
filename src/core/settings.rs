@@ -8,4 +8,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const APP_CONTEXT_KEY: &str = "mEt5jdm9aTbUYnjhQM_tY_CTQL-JvXe0u9VdKEM2KmY=";
 pub const GATEWAY_URL: &str = "https://api.asodya.com";
 pub const CORTEX_API_PATH: &str = "/apps/cortex/v1";
+// Enable only after the owner notes API is released and the gateway forwards it.
+pub const ANNOTATIONS_SOURCE_ENABLED: bool = false;
 pub const LOGIN_URL: &str = "https://auth.asodya.com/login";

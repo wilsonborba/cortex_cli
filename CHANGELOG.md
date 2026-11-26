@@ -19,6 +19,7 @@
 - Add Cortex chat streaming and inline activity view
 - Use accepted output identity for cancellation and reconnect
 - Merge inline terminal chat
+- Add explicit Annotations note selection
 - Add phone control for interactive sessions
 - Consume typed tool requests
 - Execute output-bound approved tool actions
@@ -39,6 +40,7 @@
 - Keep narrow terminal activity details readable
 - Correlate streamed results with the selected conversation
 - Keep terminal title readable on light backgrounds
+- Disclose omitted selected-note blocks
 - Bound read and search behavior
 - Retry remote approval decisions safely
 - Retry owned phone approval acknowledgement

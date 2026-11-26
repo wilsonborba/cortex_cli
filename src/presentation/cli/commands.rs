@@ -27,6 +27,7 @@ pub struct ChatOptions {
     pub conversation: Option<String>,
     pub continue_latest: bool,
     pub remote_control: bool,
+    pub note_ids: Vec<String>,
     pub provider: Option<Provider>,
     pub model: Option<String>,
 }
@@ -80,6 +81,18 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
                 }
                 options.continue_latest = true;
             }
+            "--note-id" => {
+                let id = args.next().ok_or(ParseError)?;
+                if !crate::domain::models::chat::valid_id(id)
+                    || options
+                        .note_ids
+                        .iter()
+                        .any(|selected| selected.eq_ignore_ascii_case(id))
+                {
+                    return Err(ParseError);
+                }
+                options.note_ids.push(id.to_ascii_lowercase());
+            }
             "--remote-control" | "--remote" => {
                 if options.remote_control {
                     return Err(ParseError);
@@ -115,6 +128,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, ParseE
             }
             _ => return Err(ParseError),
         }
+    }
+    if options.provider.is_some() && !options.note_ids.is_empty() {
+        return Err(ParseError);
     }
     if (options.remote_control && options.prompt.is_some())
         || options.provider.is_some() != options.model.is_some()
