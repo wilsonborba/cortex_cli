@@ -19,11 +19,12 @@ use crate::{
     },
     domain::{
         models::{
+            annotations::SelectedContext,
             chat::{ChatFailure, ChatPage, StreamEvent},
             native_auth::{AuthFailure, Session},
         },
         services::{
-            annotations::{selected_context, upload_selected_context},
+            annotations::{selected_context, upload_context},
             auth::AuthService,
             chat::{ChatApi, ChatState, follow, latest_chat, owned_history, running_output},
             telemetry::{Telemetry, TrackingApi, establish_consent},
@@ -40,6 +41,25 @@ use std::{
 
 fn failure(error: impl ToString) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+fn write_note_disclosure(
+    context: &SelectedContext,
+    non_interactive: bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let Some(notice) = context.omission_notice() else {
+        return Ok(());
+    };
+    writeln!(out, "{notice}")?;
+    if non_interactive {
+        return Err(failure(ChatFailure::PartialNoteContextNonInteractive));
+    }
+    writeln!(
+        out,
+        "Only selected typed text and note titles will be attached."
+    )?;
+    out.flush()
 }
 
 fn session() -> io::Result<Arc<Session>> {
@@ -85,11 +105,15 @@ fn execute_with_note_gate(
     }
     let auth = session()?;
     let context = if options.note_ids.is_empty() {
-        String::new()
+        SelectedContext {
+            text: String::new(),
+            omissions: Vec::new(),
+        }
     } else {
         let notes = AnnotationsClient::new(auth.clone()).map_err(failure)?;
         selected_context(&notes, &options.note_ids).map_err(failure)?
     };
+    write_note_disclosure(&context, options.prompt.is_some(), out)?;
     let telemetry = telemetry_for(&auth);
     let api = Arc::new(CortexClient::new(auth).map_err(failure)?);
     let chat = if options.continue_latest {
@@ -105,7 +129,7 @@ fn execute_with_note_gate(
     if options.continue_latest && chat.is_none() {
         return Err(failure("No Cortex conversation is available to continue."));
     }
-    let file_ids = upload_selected_context(&context, |document| {
+    let file_ids = upload_context(&context, options.prompt.is_none(), |document| {
         api.upload_temporary_text("selected-annotations.txt", document)
     })
     .map_err(failure)?;
@@ -428,7 +452,7 @@ fn interactive<G: ChatApi + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::models::chat::ChatSummary;
+    use crate::domain::models::{annotations::NoteOmission, chat::ChatSummary};
     use serde_json::json;
     use std::{collections::VecDeque, io::Read};
     pub(super) static DETAIL_STATES: std::sync::Mutex<Vec<bool>> =
@@ -436,6 +460,36 @@ mod tests {
     static CANCELLATIONS: std::sync::Mutex<Vec<(String, String)>> =
         std::sync::Mutex::new(Vec::new());
     struct Fixture;
+
+    #[test]
+    fn note_disclosure_lists_omissions_and_blocks_print_mode() {
+        let context = SelectedContext {
+            text: "selected source".into(),
+            omissions: vec![NoteOmission {
+                kind: "task_card".into(),
+                count: 2,
+            }],
+        };
+        let mut output = Vec::new();
+        let error = write_note_disclosure(&context, true, &mut output).unwrap_err();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("512 KiB context limit"));
+        assert!(output.contains("task_card (2)"));
+        assert!(
+            error
+                .to_string()
+                .contains("No chat or context upload request was sent")
+        );
+
+        let mut output = Vec::new();
+        write_note_disclosure(&context, false, &mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Only selected typed text and note titles will be attached.")
+        );
+    }
+
     struct SlowFrames {
         frames: VecDeque<Vec<u8>>,
         offset: usize,

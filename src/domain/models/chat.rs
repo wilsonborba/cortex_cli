@@ -13,6 +13,8 @@ pub enum ChatFailure {
     Rejected(Option<u16>),
     InvalidInput,
     SourceUnavailable,
+    PartialNoteContextNonInteractive,
+    NoteHasNoTypedText,
     RunningOutput,
 }
 
@@ -35,6 +37,12 @@ impl fmt::Display for ChatFailure {
             Self::SourceUnavailable => {
                 f.write_str("Annotations note context is unavailable until its gateway route is ready.")
             }
+            Self::PartialNoteContextNonInteractive => f.write_str(
+                "No chat or context upload request was sent. The selected note has omitted non-text blocks; review the typed-text-only summary in an interactive chat.",
+            ),
+            Self::NoteHasNoTypedText => f.write_str(
+                "The selected note has no usable typed text. Its content cannot be attached as chat context.",
+            ),
             Self::RunningOutput => f.write_str(
                 "This conversation has a running output. Resume without a new prompt, or wait for it to finish.",
             ),
