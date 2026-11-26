@@ -23,7 +23,7 @@ use crate::{
             native_auth::{AuthFailure, Session},
         },
         services::{
-            annotations::{selected_context, with_selected_context},
+            annotations::{selected_context, upload_selected_context},
             auth::AuthService,
             chat::{ChatApi, ChatState, follow, latest_chat, owned_history, running_output},
             telemetry::{Telemetry, TrackingApi, establish_consent},
@@ -105,6 +105,10 @@ fn execute_with_note_gate(
     if options.continue_latest && chat.is_none() {
         return Err(failure("No Cortex conversation is available to continue."));
     }
+    let file_ids = upload_selected_context(&context, |document| {
+        api.upload_temporary_text("selected-annotations.txt", document)
+    })
+    .map_err(failure)?;
     if let Some(prompt) = options.prompt {
         if history
             .as_ref()
@@ -121,27 +125,28 @@ fn execute_with_note_gate(
             ..Default::default()
         };
         let mut text = TerminalText::default();
-        let request = with_selected_context(&prompt, &context);
-        let result = api.send(chat.as_deref(), &request).and_then(|stream| {
-            follow(api.as_ref(), stream, &mut state, |event| {
-                if event.name == "token" {
-                    out.write_all(
-                        text.push(event.data["text"].as_str().unwrap_or(""))
-                            .as_bytes(),
-                    )
-                    .map_err(|_| ChatFailure::Connection)?;
-                    out.flush().map_err(|_| ChatFailure::Connection)?;
-                }
-                Ok(())
-            })
-        });
+        let result = api
+            .send_with_files(chat.as_deref(), &prompt, &file_ids)
+            .and_then(|stream| {
+                follow(api.as_ref(), stream, &mut state, |event| {
+                    if event.name == "token" {
+                        out.write_all(
+                            text.push(event.data["text"].as_str().unwrap_or(""))
+                                .as_bytes(),
+                        )
+                        .map_err(|_| ChatFailure::Connection)?;
+                        out.flush().map_err(|_| ChatFailure::Connection)?;
+                    }
+                    Ok(())
+                })
+            });
         if let Some(telemetry) = telemetry {
             telemetry.chat_result(result);
         }
         result.map_err(failure)?;
         return writeln!(out);
     }
-    interactive(api, chat, history, &context, telemetry, out)
+    interactive(api, chat, history, &file_ids, telemetry, out)
 }
 
 fn telemetry_for(session: &Arc<Session>) -> Option<Arc<Telemetry>> {
@@ -194,7 +199,7 @@ fn interactive<G: ChatApi + 'static>(
     api: Arc<G>,
     mut chat: Option<String>,
     history: Option<ChatPage>,
-    context: &str,
+    file_ids: &[String],
     telemetry: Option<Arc<Telemetry>>,
     out: &mut impl Write,
 ) -> io::Result<()> {
@@ -379,20 +384,21 @@ fn interactive<G: ChatApi + 'static>(
                         let (tx, rx) = mpsc::channel();
                         receiver = Some(rx);
                         let api = api.clone();
+                        let file_ids = file_ids.to_vec();
                         let telemetry = telemetry.clone();
                         let id = chat.clone();
-                        let context = context.to_owned();
                         thread::spawn(move || {
                             let mut state = ChatState {
                                 chat_id: id.clone(),
                                 ..Default::default()
                             };
-                            let request = with_selected_context(&text, &context);
-                            let result = api.send(id.as_deref(), &request).and_then(|stream| {
-                                follow(api.as_ref(), stream, &mut state, |event| {
-                                    tx.send(Ok(event)).map_err(|_| ChatFailure::Connection)
-                                })
-                            });
+                            let result = api
+                                .send_with_files(id.as_deref(), &text, &file_ids)
+                                .and_then(|stream| {
+                                    follow(api.as_ref(), stream, &mut state, |event| {
+                                        tx.send(Ok(event)).map_err(|_| ChatFailure::Connection)
+                                    })
+                                });
                             if let Some(telemetry) = telemetry {
                                 telemetry.chat_result(result);
                             }
@@ -515,7 +521,7 @@ mod tests {
         assert!(io::stdin().is_terminal());
         let mut out = io::stdout().lock();
         write!(out, "\x1b[2J\x1b[H").unwrap();
-        interactive(Arc::new(Fixture), None, None, "", None, &mut out).unwrap();
+        interactive(Arc::new(Fixture), None, None, &[], None, &mut out).unwrap();
         assert_eq!(*DETAIL_STATES.lock().unwrap(), vec![true, false]);
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     }
@@ -524,7 +530,7 @@ mod tests {
     fn terminal_cancel_fixture() {
         assert!(io::stdin().is_terminal());
         let mut out = io::stdout().lock();
-        interactive(Arc::new(Fixture), None, None, "", None, &mut out).unwrap();
+        interactive(Arc::new(Fixture), None, None, &[], None, &mut out).unwrap();
         assert_eq!(
             *CANCELLATIONS.lock().unwrap(),
             vec![(

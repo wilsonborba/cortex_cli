@@ -1,7 +1,7 @@
 //! Authenticated Cortex routes through the gateway. No backend identity headers.
 
 use reqwest::{
-    blocking::{Client, RequestBuilder, Response},
+    blocking::{Client, RequestBuilder, Response, multipart},
     redirect::Policy,
 };
 use serde_json::{Value, json};
@@ -108,6 +108,89 @@ impl CortexClient {
 }
 
 impl ChatApi for CortexClient {
+    fn upload_temporary_text(&self, name: &str, text: &str) -> Result<String, ChatFailure> {
+        if name.is_empty() || name.len() > 128 || text.is_empty() || text.len() > 512 * 1024 {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let part = multipart::Part::text(text.to_owned())
+            .file_name(name.to_owned())
+            .mime_str("text/plain; charset=utf-8")
+            .map_err(|_| ChatFailure::InvalidInput)?;
+        let form = multipart::Form::new()
+            .text("app_id", "cortex")
+            .text("temporary", "true")
+            .part("file", part);
+        let response = self
+            .authenticated(
+                self.client
+                    .post(format!("{}/files", self.base))
+                    .multipart(form),
+                true,
+            )
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let response = Self::checked(response)?;
+        if response.status().as_u16() != 201 {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        let value = Self::json(response)?;
+        value["data"]["file_id"]
+            .as_str()
+            .filter(|id| valid_id(id))
+            .map(str::to_owned)
+            .ok_or(ChatFailure::InvalidResponse)
+    }
+
+    fn send_with_files(
+        &self,
+        chat: Option<&str>,
+        text: &str,
+        file_ids: &[String],
+    ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        if text.trim().is_empty() || file_ids.iter().any(|id| !valid_id(id)) {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let (path, mut body) = match chat {
+            Some(id) if valid_id(id) => (
+                format!("/chats/{id}/inputs"),
+                json!({"text":text,"stream":true}),
+            ),
+            Some(_) => return Err(ChatFailure::InvalidInput),
+            None => (
+                "/chats".into(),
+                json!({"app_id":"cortex","text":text,"stream":true}),
+            ),
+        };
+        if !file_ids.is_empty() {
+            body["file_ids"] = json!(file_ids);
+        }
+        let response = self
+            .authenticated(
+                self.client
+                    .post(format!("{}{path}", self.base))
+                    .json(&body)
+                    .header("Accept", "text/event-stream"),
+                true,
+            )
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let response = Self::checked(response)?;
+        if response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            != "text/event-stream"
+        {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        Ok(Box::new(response))
+    }
+
     fn send(&self, chat: Option<&str>, text: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
         if text.trim().is_empty() {
             return Err(ChatFailure::InvalidInput);
@@ -286,6 +369,68 @@ mod tests {
             }
             assert!(value.get("session_id").is_none());
             assert!(value.get("user_id").is_none());
+        }
+    }
+
+    #[test]
+    fn temporary_text_upload_returns_only_a_real_owned_file_id() {
+        let (client, worker) = server(
+            201,
+            "application/json",
+            json!({"data":{"file_id":OUTPUT}}).to_string(),
+        );
+        assert_eq!(
+            client
+                .upload_temporary_text("selected-annotations.txt", "Section b1\nCell")
+                .unwrap(),
+            OUTPUT
+        );
+        let request = worker.join().unwrap();
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        let lower = head.to_lowercase();
+        assert!(head.starts_with("POST /apps/cortex/v1/files HTTP/1.1"));
+        assert!(lower.contains("x-csrf-token: fixture-csrf"));
+        assert!(body.contains("name=\"app_id\""));
+        assert!(body.contains("cortex"));
+        assert!(body.contains("name=\"temporary\""));
+        assert!(body.contains("true"));
+        assert!(body.contains("name=\"file\"; filename=\"selected-annotations.txt\""));
+        assert!(body.contains("text/plain; charset=utf-8"));
+        assert!(body.contains("Section b1\nCell"));
+    }
+
+    #[test]
+    fn temporary_text_upload_rejects_non_created_responses_even_with_an_id() {
+        let (client, worker) = server(
+            200,
+            "application/json",
+            json!({"data":{"file_id":OUTPUT}}).to_string(),
+        );
+        assert!(matches!(
+            client.upload_temporary_text("selected-annotations.txt", "context"),
+            Err(ChatFailure::InvalidResponse)
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn selected_file_and_original_question_reach_new_and_next_chat_inputs() {
+        for id in [None, Some(CHAT)] {
+            let (client, worker) = server(200, "text/event-stream", String::new());
+            drop(
+                client
+                    .send_with_files(id, "Explain this exactly", &[OUTPUT.to_owned()])
+                    .unwrap(),
+            );
+            let request = worker.join().unwrap();
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            let expected = id
+                .map(|id| format!("/chats/{id}/inputs"))
+                .unwrap_or("/chats".into());
+            assert!(head.starts_with(&format!("POST /apps/cortex/v1{expected} HTTP/1.1")));
+            let value: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(value["text"], "Explain this exactly");
+            assert_eq!(value["file_ids"], json!([OUTPUT]));
         }
     }
 

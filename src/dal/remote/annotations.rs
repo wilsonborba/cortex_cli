@@ -117,9 +117,7 @@ impl AnnotationsClient {
                 .as_str()
                 .filter(|id| !id.is_empty() && id.len() <= 128)
                 .ok_or(ChatFailure::InvalidResponse)?;
-            let mut pieces = Vec::new();
-            collect_text(block, &mut pieces);
-            let text = pieces.join("");
+            let text = block_text(block)?;
             if !text.is_empty() {
                 sections.push(NoteSection {
                     id: id.to_owned(),
@@ -138,20 +136,84 @@ impl AnnotationsClient {
     }
 }
 
-fn collect_text(value: &Value, output: &mut Vec<String>) {
-    match value {
-        Value::Array(items) => items.iter().for_each(|item| collect_text(item, output)),
-        Value::Object(object) => {
-            if let Some(text) = object.get("text").and_then(Value::as_str) {
-                output.push(text.to_owned());
+fn spans(value: &Value) -> Result<String, ChatFailure> {
+    let values = value.as_array().ok_or(ChatFailure::InvalidResponse)?;
+    let mut result = String::new();
+    for span in values {
+        result.push_str(span["text"].as_str().ok_or(ChatFailure::InvalidResponse)?);
+    }
+    Ok(result)
+}
+
+fn block_text(block: &Value) -> Result<String, ChatFailure> {
+    match block["kind"].as_str().ok_or(ChatFailure::InvalidResponse)? {
+        "paragraph" => spans(&block["spans"]),
+        "heading" => {
+            let level = block["level"]
+                .as_u64()
+                .filter(|n| (1..=6).contains(n))
+                .ok_or(ChatFailure::InvalidResponse)?;
+            Ok(format!(
+                "{} {}",
+                "#".repeat(level as usize),
+                spans(&block["spans"])?
+            ))
+        }
+        "list" => {
+            let items = block["items"]
+                .as_array()
+                .ok_or(ChatFailure::InvalidResponse)?;
+            let ordered = block["ordered"]
+                .as_bool()
+                .ok_or(ChatFailure::InvalidResponse)?;
+            let mut lines = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                let prefix = if ordered {
+                    format!("{}. ", index + 1)
+                } else {
+                    "• ".to_owned()
+                };
+                lines.push(format!("{prefix}{}", spans(&item["spans"])?));
             }
-            for (key, child) in object {
-                if key != "text" {
-                    collect_text(child, output);
+            Ok(lines.join("\n"))
+        }
+        "table" => {
+            let rows = block["rows"]
+                .as_array()
+                .ok_or(ChatFailure::InvalidResponse)?;
+            let header = block
+                .get("header")
+                .map(|value| value.as_bool().ok_or(ChatFailure::InvalidResponse))
+                .transpose()?
+                .unwrap_or(false);
+            let mut lines = Vec::with_capacity(rows.len() + usize::from(header));
+            for (index, row) in rows.iter().enumerate() {
+                let cells = row["cells"]
+                    .as_array()
+                    .ok_or(ChatFailure::InvalidResponse)?;
+                let mut values = Vec::with_capacity(cells.len());
+                for cell in cells {
+                    values.push(spans(&cell["spans"])?);
+                }
+                if header {
+                    lines.push(format!("| {} |", values.join(" | ")));
+                    if index == 0 {
+                        lines.push(format!("| {} |", vec!["---"; values.len()].join(" | ")));
+                    }
+                } else {
+                    lines.push(values.join(" | "));
                 }
             }
+            Ok(lines.join("\n"))
         }
-        _ => {}
+        "figure" => block
+            .get("caption")
+            .map(spans)
+            .transpose()
+            .map(|v| v.unwrap_or_default()),
+        // Handwriting is an ink payload, not typed text.
+        "handwriting" => Ok(String::new()),
+        _ => Err(ChatFailure::InvalidResponse),
     }
 }
 
@@ -206,7 +268,15 @@ mod tests {
             "representations": [{
                 "representation": "typed",
                 "revision_id": "20000000-0000-4000-8000-000000000002",
-                "document": {"blocks": [{"id": "b1", "kind": "paragraph", "spans": [{"text": "Cell wall"}]}]}
+                "document": {"blocks": [
+                    {"id": "b1", "kind": "paragraph", "spans": [{"text": "Cell "}, {"text": "wall ไทย"}]},
+                    {"id": "b2", "kind": "list", "ordered": false, "items": [{"spans": [{"text": "Alpha"}]}, {"spans": [{"text": "Beta"}]}]},
+                    {"id": "b3", "kind": "table", "header": true, "rows": [
+                        {"cells": [{"spans": [{"text": "Los Angeles"}]}, {"spans": [{"text": "12"}]}]},
+                        {"cells": [{"spans": [{"text": "New York"}]}, {"spans": [{"text": "13"}]}]}
+                    ]},
+                    {"id": "b4", "kind": "figure", "file_id": "30000000-0000-4000-8000-000000000003", "caption": [{"text": "Diagram"}]}
+                ]}
             }],
             "publication": null
         }).to_string();
@@ -222,7 +292,13 @@ mod tests {
         assert!(!lower.contains("x-uuid:"));
         assert_eq!(note.revision, 4);
         assert_eq!(note.sections[0].id, "b1");
-        assert_eq!(note.sections[0].text, "Cell wall");
+        assert_eq!(note.sections[0].text, "Cell wall ไทย");
+        assert_eq!(note.sections[1].text, "• Alpha\n• Beta");
+        assert_eq!(
+            note.sections[2].text,
+            "| Los Angeles | 12 |\n| --- | --- |\n| New York | 13 |"
+        );
+        assert_eq!(note.sections[3].text, "Diagram");
     }
 
     #[test]
@@ -240,6 +316,13 @@ mod tests {
         assert!(matches!(
             client.selected_note(NOTE),
             Err(ChatFailure::Rejected(None))
+        ));
+        worker.join().unwrap();
+
+        let (client, worker) = fixture("{}".into(), 403);
+        assert!(matches!(
+            client.selected_note(NOTE),
+            Err(ChatFailure::Unauthorized)
         ));
         worker.join().unwrap();
     }
