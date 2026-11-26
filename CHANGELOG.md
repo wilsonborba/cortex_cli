@@ -9,8 +9,10 @@
 - Update terminal chat changelog
 - Record provider safety and explicit telemetry consent
 - Record verified CLI release preparation
+- Update selected-note omissions changelog
 - Record partial write outcome fix
 - Record reviewed local voice input (#10)
+- Record reviewed subagent workflow
 
 
 ### Features
@@ -20,15 +22,16 @@
 - Use accepted output identity for cancellation and reconnect
 - Merge inline terminal chat
 - Add explicit Annotations note selection
-- Add phone control for interactive sessions
-- Consume typed tool requests
-- Execute output-bound approved tool actions
 - Add external provider API key support
 - Integrate reviewed external provider adapters
 - Add explicit consent-gated CLI usage tracking
 - Integrate explicit consent and fixed usage payloads
 - Prepare checksum-verified release tooling
 - Prepare verified CLI installation artifacts
+- Attach selected notes as temporary context
+- Add phone control for interactive sessions
+- Consume typed tool requests
+- Execute output-bound approved tool actions
 - Consume bounded child runs in CLI
 - Add local hold-to-talk input (#10)
 - Integrate reviewed local speech input (#10)
@@ -40,14 +43,14 @@
 - Keep narrow terminal activity details readable
 - Correlate streamed results with the selected conversation
 - Keep terminal title readable on light backgrounds
+- Bound and sanitize provider responses
+- Reject unsafe release archives
+- Clean archive after manifest publish failure
 - Disclose omitted selected-note blocks
 - Bound read and search behavior
 - Retry remote approval decisions safely
 - Retry owned phone approval acknowledgement
 - Canonicalize approval action digest
-- Bound and sanitize provider responses
-- Reject unsafe release archives
-- Clean archive after manifest publish failure
 - Report partial file action writes accurately
 - Stop voice capture and cancel transcription
 - Discard transcript after accepted cancellation
@@ -63,6 +66,7 @@
 - Bootstrap Cortex CLI layers and native build checks
 - Merge Cortex CLI bootstrap
 - Refresh sign-in formatting and changelog
+- Update selected notes changelog
 
 
 ### Tests
@@ -77,6 +81,7 @@
 
 
 ### merge
+- Refresh selected notes from accepted feature base
 - Refresh accepted base for approval tools
 - Refresh voice input from accepted feature base
 
