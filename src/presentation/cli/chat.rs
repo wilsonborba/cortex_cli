@@ -16,7 +16,7 @@ use crate::{
     },
     domain::{
         models::{
-            chat::{ChatFailure, ChatPage, StreamEvent},
+            chat::{ChatFailure, ChatPage, StreamEvent, valid_id},
             native_auth::{AuthFailure, Session},
             remote_control::{RemoteEvent, RemoteEventKind},
             tools::{ToolName, ToolResult},
@@ -550,10 +550,174 @@ fn begin_turn<G: ChatApi + 'static>(
     receiver
 }
 
+enum BoundChildMessage {
+    Bound(String, String),
+    Output(StreamEvent),
+    Lifecycle(StreamEvent),
+    Error(ChatFailure),
+}
+
+struct BoundChildTracker {
+    receiver: mpsc::Receiver<BoundChildMessage>,
+    stop: Arc<AtomicBool>,
+    terminal: bool,
+}
+
+fn verify_child_binding(
+    detail: &crate::domain::services::chat::BoundChildDetail,
+    child_id: &str,
+    parent_chat: &str,
+    parent_output: &str,
+    parent_call: &str,
+) -> Result<(), ChatFailure> {
+    if detail.child_id != child_id
+        || detail.parent_chat_session_id.as_deref() != Some(parent_chat)
+        || detail.parent_output_id.as_deref() != Some(parent_output)
+        || detail.parent_call_id.as_deref() != Some(parent_call)
+    {
+        return Err(ChatFailure::InvalidResponse);
+    }
+    Ok(())
+}
+
+fn observe_child_lifecycle(tracker: &mut BoundChildTracker, event: &StreamEvent) -> bool {
+    if matches!(event.name.as_str(), "completed" | "failed" | "cancelled") {
+        tracker.terminal = true;
+        true
+    } else {
+        false
+    }
+}
+
+fn parent_can_finish(parent_done_pending: bool, tracker: Option<&BoundChildTracker>) -> bool {
+    parent_done_pending && tracker.is_none_or(|tracker| tracker.terminal)
+}
+
+impl Drop for BoundChildTracker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+fn begin_bound_child_tracker<G: ChatApi + 'static>(
+    api: Arc<G>,
+    remote_session: String,
+    child_id: String,
+    parent_chat: String,
+    parent_output: String,
+    parent_call: String,
+) -> BoundChildTracker {
+    let (sender, receiver) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let lifecycle_api = api.clone();
+    let lifecycle_sender = sender.clone();
+    let lifecycle_remote = remote_session.clone();
+    let lifecycle_child = child_id.clone();
+    let lifecycle_stop = stop.clone();
+    thread::spawn(move || {
+        let result = lifecycle_api
+            .bound_child_events(&lifecycle_remote, &lifecycle_child, 0)
+            .and_then(|mut stream| {
+                let mut decoder = crate::dal::remote::sse::SseDecoder::default();
+                let mut buffer = [0u8; 8192];
+                while !lifecycle_stop.load(Ordering::Acquire) {
+                    let count = stream
+                        .read(&mut buffer)
+                        .map_err(|_| ChatFailure::Connection)?;
+                    if count == 0 {
+                        return Ok(());
+                    }
+                    for event in decoder.feed(&buffer[..count])? {
+                        let terminal =
+                            matches!(event.name.as_str(), "completed" | "failed" | "cancelled");
+                        if lifecycle_sender
+                            .send(BoundChildMessage::Lifecycle(event))
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                        if terminal {
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(())
+            });
+        if let Err(error) = result {
+            let _ = lifecycle_sender.send(BoundChildMessage::Error(error));
+        }
+    });
+
+    let detail_stop = stop.clone();
+    thread::spawn(move || {
+        let result = (|| {
+            let deadline = Instant::now() + Duration::from_secs(45);
+            let (chat_id, output_id) = loop {
+                if detail_stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let detail = match api.bound_child_detail(&remote_session, &child_id) {
+                    Ok(detail) => detail,
+                    Err(ChatFailure::Connection) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                verify_child_binding(
+                    &detail,
+                    &child_id,
+                    &parent_chat,
+                    &parent_output,
+                    &parent_call,
+                )?;
+                match (
+                    detail.child_chat_session_id,
+                    detail.child_output_id,
+                    detail.status.as_str(),
+                ) {
+                    (Some(chat), Some(output), _) => break (chat, output),
+                    (None, None, "completed" | "failed" | "cancelled") => return Ok(()),
+                    (None, None, _) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(250));
+                    }
+                    _ => return Err(ChatFailure::InvalidResponse),
+                }
+            };
+            if !valid_id(&chat_id) || !valid_id(&output_id) {
+                return Err(ChatFailure::InvalidResponse);
+            }
+            sender
+                .send(BoundChildMessage::Bound(chat_id.clone(), output_id.clone()))
+                .map_err(|_| ChatFailure::Connection)?;
+            let mut state = ChatState {
+                chat_id: Some(chat_id.clone()),
+                output_id: Some(output_id.clone()),
+                ..Default::default()
+            };
+            let stream = api.reconnect(&chat_id, &output_id, 0)?;
+            follow(api.as_ref(), stream, &mut state, |event| {
+                sender
+                    .send(BoundChildMessage::Output(event))
+                    .map_err(|_| ChatFailure::Connection)
+            })
+        })();
+        if let Err(error) = result {
+            let _ = sender.send(BoundChildMessage::Error(error));
+        }
+    });
+    BoundChildTracker {
+        receiver,
+        stop,
+        terminal: false,
+    }
+}
+
 fn submit_tool_call(
     api: &dyn ChatApi,
     state: &mut ChatState,
     remote_session: Option<&str>,
+    allow_child_creation: bool,
 ) -> Result<(), ChatFailure> {
     let request = state
         .tool_request
@@ -563,11 +727,24 @@ fn submit_tool_call(
         (Some(chat), Some(output)) => (chat, output),
         _ => return Err(ChatFailure::InvalidResponse),
     };
+    if allow_child_creation
+        && request.name == ToolName::InvokeSubagent
+        && let Some(remote_session) = remote_session
+    {
+        let child_id = api.register_bound_child(remote_session, chat, output, &request.call_id)?;
+        state.child_id = Some(child_id);
+        state.child_call_id = Some(request.call_id);
+        return Ok(());
+    }
     let output_text = match execute_readonly(&request) {
         Ok(Some(output)) => output,
         Ok(None) => match request.name {
             ToolName::InvokeSubagent => {
-                "Not executed: a real child runner is not available for this request.".into()
+                if allow_child_creation {
+                    "Not executed: an active owner-bound session is required for child work.".into()
+                } else {
+                    "Not executed: nested child delegation is outside this bounded runner.".into()
+                }
             }
             ToolName::ReplaceFileContent | ToolName::RunCommand => {
                 if let Some(remote_session) = remote_session {
@@ -832,10 +1009,12 @@ impl RemoteCommandQueue {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn poll(
         &mut self,
         remote: &RemoteSessionGuard,
         state: &mut ChatState,
+        mut child_state: Option<&mut ChatState>,
         controls: &mut TurnControl,
         worker: &mut ActionWorker,
         out: &mut impl Write,
@@ -895,14 +1074,23 @@ impl RemoteCommandQueue {
                     let action_id = event.payload["approval_id"].as_str();
                     match (decision, action_id) {
                         (Some(approved), Some(action_id)) => {
-                            if state
+                            let child_matches = child_state
+                                .as_ref()
+                                .and_then(|child| child.pending_action.as_ref())
+                                .is_some_and(|pending| action_id == pending.receipt.action_id);
+                            let parent_matches = state
                                 .pending_action
                                 .as_ref()
-                                .is_some_and(|pending| action_id == pending.receipt.action_id)
-                            {
+                                .is_some_and(|pending| action_id == pending.receipt.action_id);
+                            if child_matches || parent_matches {
+                                let target = if child_matches {
+                                    child_state.as_deref_mut().expect("matched child action")
+                                } else {
+                                    &mut *state
+                                };
                                 match answer_pending_action(
                                     remote.commands.chat_api(),
-                                    state,
+                                    target,
                                     &remote.session_id,
                                     approved,
                                     worker,
@@ -911,6 +1099,9 @@ impl RemoteCommandQueue {
                                     Err(_) => "approval_failed",
                                 }
                             } else if state.pending_action.is_none()
+                                && child_state
+                                    .as_ref()
+                                    .is_none_or(|child| child.pending_action.is_none())
                                 && worker.owned_action_id.as_deref() == Some(action_id)
                                 && worker.owned_approval == Some(approved)
                             {
@@ -1125,6 +1316,10 @@ fn interactive<G: ChatApi + 'static>(
     let mut editor = Editor::default();
     let mut expanded = false;
     let mut receiver: Option<mpsc::Receiver<Result<StreamEvent, ChatFailure>>> = None;
+    let mut child_tracker: Option<BoundChildTracker> = None;
+    let mut child_state: Option<ChatState> = None;
+    let mut watched_child: Option<String> = None;
+    let mut parent_done_pending = false;
     let mut started: Option<Instant> = None;
     let mut cleaner = TerminalText::default();
     let mut controls = TurnControl::default();
@@ -1200,6 +1395,7 @@ fn interactive<G: ChatApi + 'static>(
             remote_commands.poll(
                 remote,
                 &mut state,
+                child_state.as_mut(),
                 &mut controls,
                 &mut action_worker,
                 out,
@@ -1217,6 +1413,102 @@ fn interactive<G: ChatApi + 'static>(
             &mut action_worker,
             remote.as_ref().map(|remote| &remote.publisher),
         );
+        if let Some(child_state) = child_state.as_mut() {
+            poll_action_worker(
+                api.as_ref(),
+                child_state,
+                &mut action_worker,
+                remote.as_ref().map(|remote| &remote.publisher),
+            );
+        }
+        let child_messages = child_tracker
+            .as_ref()
+            .map(|tracker| {
+                let mut messages = Vec::new();
+                while let Ok(message) = tracker.receiver.try_recv() {
+                    messages.push(message);
+                }
+                messages
+            })
+            .unwrap_or_default();
+        for message in child_messages {
+            match message {
+                BoundChildMessage::Bound(chat, output) => {
+                    child_state = Some(ChatState {
+                        chat_id: Some(chat),
+                        output_id: Some(output),
+                        ..Default::default()
+                    });
+                }
+                BoundChildMessage::Output(event) => {
+                    if let Some(child_state) = child_state.as_mut()
+                        && child_state.apply(&event).unwrap_or(false)
+                    {
+                        if event.name == "token" {
+                            surface.text(
+                                out,
+                                &format!(
+                                    "\nChild: {}\n",
+                                    clean(event.data["text"].as_str().unwrap_or(""))
+                                ),
+                            )?;
+                        }
+                        if event.name == "tool_call" {
+                            if let Err(error) = submit_tool_call(
+                                api.as_ref(),
+                                child_state,
+                                remote.as_ref().map(|session| session.session_id.as_str()),
+                                false,
+                            ) {
+                                surface.text(out, &format!("\nChild tool failed: {error}\n"))?;
+                                child_state.pending_action = None;
+                            } else if let Some(action) = child_state.pending_action.as_ref() {
+                                surface.text(
+                                    out,
+                                    &format!(
+                                        "\nChild approval requested:\n{}\nPress Y to approve or N to deny.\n",
+                                        clean(&action.receipt.display)
+                                    ),
+                                )?;
+                            }
+                        }
+                        dirty = true;
+                    }
+                }
+                BoundChildMessage::Lifecycle(event) => {
+                    let message = event.data["message"].as_str().unwrap_or("");
+                    match event.name.as_str() {
+                        "progress" if !message.is_empty() => {
+                            surface.text(out, &format!("\nChild: {}\n", clean(message)))?;
+                        }
+                        "completed" => {
+                            surface.text(out, "\nChild task completed.\n")?;
+                            if let Some(tracker) = child_tracker.as_mut() {
+                                observe_child_lifecycle(tracker, &event);
+                            }
+                        }
+                        "failed" => {
+                            surface.text(out, "\nChild task failed.\n")?;
+                            if let Some(tracker) = child_tracker.as_mut() {
+                                observe_child_lifecycle(tracker, &event);
+                            }
+                        }
+                        "cancelled" => {
+                            surface.text(out, "\nChild stopped after confirmed cancellation.\n")?;
+                            if let Some(tracker) = child_tracker.as_mut() {
+                                observe_child_lifecycle(tracker, &event);
+                            }
+                        }
+                        _ => {}
+                    }
+                    dirty = true;
+                }
+                BoundChildMessage::Error(error) => {
+                    surface.text(out, &format!("\nChild stream error: {error}\n"))?;
+                    dirty = true;
+                }
+            }
+        }
         if let Some(rx) = receiver.as_ref() {
             let mut finished = false;
             loop {
@@ -1260,10 +1552,35 @@ fn interactive<G: ChatApi + 'static>(
                                     api.as_ref(),
                                     &mut state,
                                     remote.as_ref().map(|session| session.session_id.as_str()),
+                                    true,
                                 ) {
                                     surface.text(out, &format!("\n{error}\n"))?;
                                     finished = true;
                                     break;
+                                }
+                                if let (
+                                    Some(remote),
+                                    Some(child_id),
+                                    Some(parent_chat),
+                                    Some(parent_output),
+                                    Some(parent_call),
+                                ) = (
+                                    remote.as_ref(),
+                                    state.child_id.as_ref(),
+                                    state.chat_id.as_ref(),
+                                    state.output_id.as_ref(),
+                                    state.child_call_id.as_ref(),
+                                ) && watched_child.as_deref() != Some(child_id)
+                                {
+                                    watched_child = Some(child_id.clone());
+                                    child_tracker = Some(begin_bound_child_tracker(
+                                        api.clone(),
+                                        remote.session_id.clone(),
+                                        child_id.clone(),
+                                        parent_chat.clone(),
+                                        parent_output.clone(),
+                                        parent_call.clone(),
+                                    ));
                                 }
                                 if let Some(action) = state.pending_action.as_ref() {
                                     surface.text(
@@ -1273,14 +1590,22 @@ fn interactive<G: ChatApi + 'static>(
                                             clean(&action.receipt.display)
                                         ),
                                     )?;
+                                } else if state.child_id.is_some() {
+                                    surface.text(
+                                        out,
+                                        "\nBound child started; waiting for its result.\n",
+                                    )?;
                                 } else {
                                     surface.text(out, "\nTool result returned to Cortex.\n")?;
                                 }
                             }
                             if state.complete {
                                 chat = state.chat_id.clone();
-                                finished = true;
-                                break;
+                                parent_done_pending = true;
+                                if parent_can_finish(parent_done_pending, child_tracker.as_ref()) {
+                                    finished = true;
+                                    break;
+                                }
                             }
                         }
                         Ok(false) => {}
@@ -1297,9 +1622,15 @@ fn interactive<G: ChatApi + 'static>(
                     }
                 }
             }
+            if parent_can_finish(parent_done_pending, child_tracker.as_ref()) {
+                finished = true;
+            }
             if finished {
                 receiver = None;
                 started = None;
+                child_tracker = None;
+                child_state = None;
+                parent_done_pending = false;
                 controls.stop_requested = false;
                 dirty = true;
             }
@@ -1373,7 +1704,10 @@ fn interactive<G: ChatApi + 'static>(
                     }
                     continue;
                 }
-                if state.pending_action.is_some()
+                if (state.pending_action.is_some()
+                    || child_state
+                        .as_ref()
+                        .is_some_and(|child| child.pending_action.is_some()))
                     && !control
                     && !key.modifiers.contains(KeyModifiers::ALT)
                     && matches!(key.code, KeyCode::Char('y' | 'Y' | 'n' | 'N'))
@@ -1384,12 +1718,23 @@ fn interactive<G: ChatApi + 'static>(
                             out,
                             "\nApproval session unavailable; action not executed.\n",
                         )?;
-                        state.pending_action = None;
+                        if let Some(child) = child_state.as_mut()
+                            && child.pending_action.is_some()
+                        {
+                            child.pending_action = None;
+                        } else {
+                            state.pending_action = None;
+                        }
                         continue;
+                    };
+                    let target = if state.pending_action.is_some() {
+                        &mut state
+                    } else {
+                        child_state.as_mut().expect("child action is pending")
                     };
                     match answer_pending_action(
                         api.as_ref(),
-                        &mut state,
+                        target,
                         &remote.session_id,
                         approved,
                         &mut action_worker,
@@ -1481,6 +1826,313 @@ mod tests {
         std::sync::Mutex::new(Vec::new());
     static CANCELLATIONS: std::sync::Mutex<Vec<(String, String)>> =
         std::sync::Mutex::new(Vec::new());
+    type SubmittedToolResult = (String, String, String, String, String);
+
+    #[test]
+    fn invoke_subagent_registers_server_child_without_fake_parent_result() {
+        use std::sync::Mutex;
+
+        struct ChildApi {
+            registered: Mutex<Vec<(String, String, String, String)>>,
+            submitted: Mutex<Vec<SubmittedToolResult>>,
+        }
+        impl ChatApi for ChildApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn register_bound_child(
+                &self,
+                remote: &str,
+                chat: &str,
+                output: &str,
+                call_id: &str,
+            ) -> Result<String, ChatFailure> {
+                self.registered.lock().unwrap().push((
+                    remote.into(),
+                    chat.into(),
+                    output.into(),
+                    call_id.into(),
+                ));
+                Ok("50000000-0000-4000-8000-000000000005".into())
+            }
+            fn submit_tool_result(
+                &self,
+                chat: &str,
+                output: &str,
+                result: &crate::domain::models::tools::ToolResult,
+            ) -> Result<(), ChatFailure> {
+                self.submitted.lock().unwrap().push((
+                    chat.into(),
+                    output.into(),
+                    result.call_id.clone(),
+                    result.name.as_str().to_owned(),
+                    result.output.clone(),
+                ));
+                Ok(())
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(
+                &self,
+                _: &str,
+            ) -> Result<crate::domain::models::chat::ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+        }
+
+        let call_id = "30000000-0000-4000-8000-000000000003";
+        let api = ChildApi {
+            registered: Mutex::new(Vec::new()),
+            submitted: Mutex::new(Vec::new()),
+        };
+        let request = crate::domain::models::tools::ToolRequest::from_event(&json!({
+            "call_id":call_id,
+            "name":"invoke_subagent",
+            "arguments":{"role":"reviewer","task":"Inspect selected workspace"}
+        }))
+        .unwrap();
+        let mut state = ChatState {
+            chat_id: Some("10000000-0000-4000-8000-000000000001".into()),
+            output_id: Some("20000000-0000-4000-8000-000000000002".into()),
+            tool_request: Some(request),
+            ..Default::default()
+        };
+
+        submit_tool_call(
+            &api,
+            &mut state,
+            Some("40000000-0000-4000-8000-000000000004"),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *api.registered.lock().unwrap(),
+            vec![(
+                "40000000-0000-4000-8000-000000000004".into(),
+                "10000000-0000-4000-8000-000000000001".into(),
+                "20000000-0000-4000-8000-000000000002".into(),
+                call_id.into()
+            )]
+        );
+        assert_eq!(
+            state.child_id.as_deref(),
+            Some("50000000-0000-4000-8000-000000000005")
+        );
+        assert!(api.submitted.lock().unwrap().is_empty());
+
+        let nested_call = "60000000-0000-4000-8000-000000000006";
+        let nested_request = crate::domain::models::tools::ToolRequest::from_event(&json!({
+            "call_id":nested_call,
+            "name":"invoke_subagent",
+            "arguments":{"role":"planner","task":"Try to delegate again"}
+        }))
+        .unwrap();
+        let mut child_state = ChatState {
+            chat_id: Some("70000000-0000-4000-8000-000000000007".into()),
+            output_id: Some("80000000-0000-4000-8000-000000000008".into()),
+            tool_request: Some(nested_request),
+            ..Default::default()
+        };
+        submit_tool_call(
+            &api,
+            &mut child_state,
+            Some("40000000-0000-4000-8000-000000000004"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(api.registered.lock().unwrap().len(), 1);
+        let submitted = api.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].0, "70000000-0000-4000-8000-000000000007");
+        assert_eq!(submitted[0].1, "80000000-0000-4000-8000-000000000008");
+        assert_eq!(submitted[0].2, nested_call);
+        assert_eq!(submitted[0].3, "invoke_subagent");
+        assert!(submitted[0].4.contains("nested child delegation"));
+    }
+
+    #[test]
+    fn bound_child_uses_owned_detail_then_child_chat_sse_and_terminal_lifecycle() {
+        struct ChildStreamApi;
+        const REMOTE: &str = "40000000-0000-4000-8000-000000000004";
+        const PARENT_CHAT: &str = "10000000-0000-4000-8000-000000000001";
+        const PARENT_OUTPUT: &str = "20000000-0000-4000-8000-000000000002";
+        const CALL: &str = "30000000-0000-4000-8000-000000000003";
+        const CHILD: &str = "50000000-0000-4000-8000-000000000005";
+        const CHILD_CHAT: &str = "70000000-0000-4000-8000-000000000007";
+        const CHILD_OUTPUT: &str = "80000000-0000-4000-8000-000000000008";
+        impl ChatApi for ChildStreamApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn bound_child_detail(
+                &self,
+                _: &str,
+                child: &str,
+            ) -> Result<crate::domain::services::chat::BoundChildDetail, ChatFailure> {
+                Ok(crate::domain::services::chat::BoundChildDetail {
+                    child_id: child.into(),
+                    parent_chat_session_id: Some(PARENT_CHAT.into()),
+                    parent_output_id: Some(PARENT_OUTPUT.into()),
+                    parent_call_id: Some(CALL.into()),
+                    child_chat_session_id: Some(CHILD_CHAT.into()),
+                    child_output_id: Some(CHILD_OUTPUT.into()),
+                    status: "running".into(),
+                })
+            }
+            fn bound_child_events(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                let sse = "id: 1\nevent: completed\ndata: {\"message\":\"Child complete\",\"data\":{\"seq\":1,\"kind\":\"completed\",\"result\":\"finished\"}}\n\n";
+                Ok(Box::new(Cursor::new(sse.as_bytes().to_vec())))
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(
+                &self,
+                _: &str,
+            ) -> Result<crate::domain::models::chat::ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                chat: &str,
+                output: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                assert_eq!(chat, CHILD_CHAT);
+                assert_eq!(output, CHILD_OUTPUT);
+                let sse = format!(
+                    "id: 1\nevent: tool_call\ndata: {{\"message\":\"Tool requested\",\"data\":{{\"call_id\":\"{CALL}\",\"name\":\"view_file\",\"arguments\":{{\"path\":\"README.md\",\"start_line\":1}}}}}}\n\nid: 2\nevent: done\ndata: {{\"message\":\"Done\",\"data\":{{\"session_id\":\"{CHILD_CHAT}\",\"output_id\":\"{CHILD_OUTPUT}\",\"total_ms\":10}}}}\n\n"
+                );
+                Ok(Box::new(Cursor::new(sse.into_bytes())))
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+        }
+
+        let mut tracker = begin_bound_child_tracker(
+            Arc::new(ChildStreamApi),
+            REMOTE.into(),
+            CHILD.into(),
+            PARENT_CHAT.into(),
+            PARENT_OUTPUT.into(),
+            CALL.into(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut bound = false;
+        let mut tool_call = false;
+        let mut output_done = false;
+        let mut lifecycle_done = false;
+        while Instant::now() < deadline && !(bound && tool_call && output_done && lifecycle_done) {
+            match tracker.receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(BoundChildMessage::Bound(chat, output)) => {
+                    assert_eq!(chat, CHILD_CHAT);
+                    assert_eq!(output, CHILD_OUTPUT);
+                    bound = true;
+                }
+                Ok(BoundChildMessage::Output(event)) if event.name == "tool_call" => {
+                    assert_eq!(event.data["call_id"], CALL);
+                    tool_call = true;
+                }
+                Ok(BoundChildMessage::Output(event)) if event.name == "done" => {
+                    output_done = true;
+                }
+                Ok(BoundChildMessage::Lifecycle(event)) if event.name == "completed" => {
+                    tracker.terminal = true;
+                    lifecycle_done = true;
+                }
+                Ok(BoundChildMessage::Error(error)) => panic!("child tracker failed: {error}"),
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(bound && tool_call && output_done && lifecycle_done);
+        assert!(tracker.terminal);
+    }
+
+    #[test]
+    fn bound_child_detail_rejects_a_foreign_parent_session_or_call() {
+        let detail = crate::domain::services::chat::BoundChildDetail {
+            child_id: "50000000-0000-4000-8000-000000000005".into(),
+            parent_chat_session_id: Some("10000000-0000-4000-8000-000000000001".into()),
+            parent_output_id: Some("20000000-0000-4000-8000-000000000002".into()),
+            parent_call_id: Some("30000000-0000-4000-8000-000000000003".into()),
+            child_chat_session_id: None,
+            child_output_id: None,
+            status: "queued".into(),
+        };
+        assert!(
+            verify_child_binding(
+                &detail,
+                "50000000-0000-4000-8000-000000000005",
+                "10000000-0000-4000-8000-000000000001",
+                "20000000-0000-4000-8000-000000000002",
+                "30000000-0000-4000-8000-000000000003"
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            verify_child_binding(
+                &detail,
+                "50000000-0000-4000-8000-000000000005",
+                "90000000-0000-4000-8000-000000000009",
+                "20000000-0000-4000-8000-000000000002",
+                "30000000-0000-4000-8000-000000000003"
+            ),
+            Err(ChatFailure::InvalidResponse)
+        );
+        assert_eq!(
+            verify_child_binding(
+                &detail,
+                "50000000-0000-4000-8000-000000000005",
+                "10000000-0000-4000-8000-000000000001",
+                "20000000-0000-4000-8000-000000000002",
+                "60000000-0000-4000-8000-000000000006"
+            ),
+            Err(ChatFailure::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn parent_completion_waits_for_child_failure_or_cancel_terminal_event() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut tracker = BoundChildTracker {
+            receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            terminal: false,
+        };
+        assert!(!parent_can_finish(true, Some(&tracker)));
+        for status in ["failed", "cancelled"] {
+            let event = StreamEvent {
+                id: Some(1),
+                name: status.into(),
+                message: status.into(),
+                data: json!({}),
+            };
+            assert!(observe_child_lifecycle(&mut tracker, &event));
+            assert!(parent_can_finish(true, Some(&tracker)));
+            tracker.terminal = false;
+        }
+        assert!(parent_can_finish(true, None));
+    }
 
     struct AckWaitReader {
         frame: Cursor<Vec<u8>>,
@@ -1835,6 +2487,7 @@ mod tests {
             .poll(
                 &remote,
                 &mut replay_state,
+                None,
                 &mut controls,
                 &mut action_worker,
                 &mut screen,
@@ -1856,6 +2509,7 @@ mod tests {
             .poll(
                 &remote,
                 &mut replay_state,
+                None,
                 &mut controls,
                 &mut action_worker,
                 &mut screen,
@@ -1886,6 +2540,7 @@ mod tests {
             .poll(
                 &remote,
                 &mut replay_state,
+                None,
                 &mut controls,
                 &mut action_worker,
                 &mut screen,

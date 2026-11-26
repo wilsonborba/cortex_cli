@@ -10,6 +10,17 @@ use crate::{
 use serde_json::Value;
 use std::io::Read;
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct BoundChildDetail {
+    pub child_id: String,
+    pub parent_chat_session_id: Option<String>,
+    pub parent_output_id: Option<String>,
+    pub parent_call_id: Option<String>,
+    pub child_chat_session_id: Option<String>,
+    pub child_output_id: Option<String>,
+    pub status: String,
+}
+
 pub trait ChatApi: Send + Sync {
     fn send(&self, chat: Option<&str>, text: &str) -> Result<Box<dyn Read + Send>, ChatFailure>;
     fn send_with_files(
@@ -38,6 +49,30 @@ pub trait ChatApi: Send + Sync {
         _output: &str,
         _result: &ToolResult,
     ) -> Result<(), ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn register_bound_child(
+        &self,
+        _remote_session: &str,
+        _chat: &str,
+        _output: &str,
+        _call_id: &str,
+    ) -> Result<String, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn bound_child_events(
+        &self,
+        _remote_session: &str,
+        _child_id: &str,
+        _after: u64,
+    ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+        Err(ChatFailure::InvalidResponse)
+    }
+    fn bound_child_detail(
+        &self,
+        _remote_session: &str,
+        _child_id: &str,
+    ) -> Result<BoundChildDetail, ChatFailure> {
         Err(ChatFailure::InvalidResponse)
     }
     fn create_output_action(
@@ -158,6 +193,8 @@ pub struct ChatState {
     pub total_ms: Option<u64>,
     pub tool_request: Option<ToolRequest>,
     pub pending_action: Option<PendingOutputAction>,
+    pub child_id: Option<String>,
+    pub child_call_id: Option<String>,
 }
 
 impl ChatState {
