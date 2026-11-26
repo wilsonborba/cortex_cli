@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -39,7 +39,7 @@ impl std::fmt::Display for ToolError {
             Self::ActionCancelled => "The approved action was cancelled before completion.",
             Self::ActionTimedOut => "The command was stopped at its time limit.",
             Self::ActionOutcomeUnknown => {
-                "The command stopped before its outcome could be confirmed."
+                "The approved action may have a partial effect; it will not run again automatically."
             }
         })
     }
@@ -166,7 +166,13 @@ fn execute_approved_action_at(
             if digest_bytes(current.as_bytes()) != *digest {
                 return Err(ToolError::ReadFailed);
             }
-            fs::write(path, changed).map_err(|_| ToolError::ReadFailed)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .map_err(|_| ToolError::ReadFailed)?;
+            file.write_all(changed.as_bytes())
+                .map_err(|_| ToolError::ActionOutcomeUnknown)?;
             Ok("File change applied.".into())
         }
         (ToolName::RunCommand, ActionPreimage::Command { cwd }) => {
@@ -559,9 +565,72 @@ mod tests {
     use std::{
         fs,
         os::unix::fs::symlink,
+        path::PathBuf,
+        process::Command,
         sync::atomic::AtomicBool,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn partial_write_fixture_child() {
+        let Ok(path) = std::env::var("CORTEX_CLI_PARTIAL_WRITE_PATH") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        fs::write(&path, "before").unwrap();
+        let request = ToolRequest::from_event(&json!({
+            "call_id":"30000000-0000-4000-8000-000000000003",
+            "name":"replace_file_content",
+            "arguments":{"path":"partial.txt","find":"before","replace":"x".repeat(4096)}
+        }))
+        .unwrap();
+        let root = path.parent().unwrap().canonicalize().unwrap();
+        let preimage = prepare_action_at(&request, &root).unwrap();
+        assert_eq!(
+            execute_approved_action_at(&request, &preimage, &AtomicBool::new(false), &root),
+            Err(ToolError::ActionOutcomeUnknown)
+        );
+        let written = fs::metadata(&path).unwrap().len();
+        assert!(
+            written > 0 && written < 4096,
+            "expected a partial write, got {written} bytes"
+        );
+    }
+
+    #[test]
+    fn partial_file_write_is_not_reported_as_zero_effect() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("cortex-cli-partial-write-{nonce}"));
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("partial.txt");
+        let test_binary = std::env::current_exe().unwrap();
+        let output = Command::new("sh")
+            .args(["-c", "ulimit -f 1; trap '' XFSZ; exec \"$@\"", "sh"])
+            .arg(test_binary)
+            .args([
+                "--exact",
+                "domain::services::tools::tests::partial_write_fixture_child",
+                "--nocapture",
+            ])
+            .env("CORTEX_CLI_PARTIAL_WRITE_PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "limited child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let written = fs::metadata(&path).unwrap().len();
+        assert!(
+            written > 0 && written < 4096,
+            "expected a partial write, got {written} bytes"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
 
     #[test]
     fn symlinks_resolving_outside_the_workspace_are_rejected() {

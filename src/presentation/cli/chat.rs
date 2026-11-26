@@ -787,7 +787,7 @@ fn poll_action_worker(
             Err(crate::domain::services::tools::ToolError::ActionOutcomeUnknown) => {
                 if let Some(action) = state.pending_action.as_mut() {
                     action.completed_result = Some(
-                        "Command outcome is unknown. It was stopped and will not be rerun automatically.".into(),
+                        "The approved action may have a partial effect. Its result will be reported without running it again.".into(),
                     );
                 }
             }
