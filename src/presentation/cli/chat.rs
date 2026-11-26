@@ -904,6 +904,7 @@ fn decode_child_lifecycle_frame(
 #[derive(Default)]
 struct ParentEventPump {
     disconnected: bool,
+    failed: bool,
 }
 
 enum ParentEventPoll {
@@ -911,6 +912,7 @@ enum ParentEventPoll {
     Empty,
     WaitingForChild,
     Disconnected,
+    Failed,
 }
 
 impl ParentEventPump {
@@ -919,6 +921,13 @@ impl ParentEventPump {
         receiver: &mpsc::Receiver<Result<StreamEvent, ChatFailure>>,
         child_live: bool,
     ) -> ParentEventPoll {
+        if self.failed {
+            return if child_live {
+                ParentEventPoll::WaitingForChild
+            } else {
+                ParentEventPoll::Failed
+            };
+        }
         if self.disconnected {
             return if child_live {
                 ParentEventPoll::WaitingForChild
@@ -937,6 +946,15 @@ impl ParentEventPump {
                     ParentEventPoll::Disconnected
                 }
             }
+        }
+    }
+
+    fn fail(&mut self, child_live: bool) -> ParentEventPoll {
+        self.failed = true;
+        if child_live {
+            ParentEventPoll::WaitingForChild
+        } else {
+            ParentEventPoll::Failed
         }
     }
 }
@@ -2060,10 +2078,16 @@ fn interactive<G: ChatApi + 'static>(
                 let result = match parent_pump.poll(rx, child_live) {
                     ParentEventPoll::Event(value) => value,
                     ParentEventPoll::Empty | ParentEventPoll::WaitingForChild => break,
+                    ParentEventPoll::Failed => {
+                        finished = true;
+                        break;
+                    }
                     ParentEventPoll::Disconnected => {
                         if !state.complete {
                             surface.text(out, &format!("\n{}\n", ChatFailure::IncompleteStream))?;
-                            finished = true;
+                            if matches!(parent_pump.fail(child_live), ParentEventPoll::Failed) {
+                                finished = true;
+                            }
                         }
                         break;
                     }
@@ -2158,13 +2182,23 @@ fn interactive<G: ChatApi + 'static>(
                         Ok(false) => {}
                         Err(error) => {
                             surface.text(out, &format!("\n{error}\n"))?;
-                            finished = true;
+                            let child_live = child_tracker
+                                .as_ref()
+                                .is_some_and(|tracker| !tracker.terminal);
+                            if matches!(parent_pump.fail(child_live), ParentEventPoll::Failed) {
+                                finished = true;
+                            }
                             break;
                         }
                     },
                     Err(error) => {
                         surface.text(out, &format!("\n{error}\n"))?;
-                        finished = true;
+                        let child_live = child_tracker
+                            .as_ref()
+                            .is_some_and(|tracker| !tracker.terminal);
+                        if matches!(parent_pump.fail(child_live), ParentEventPoll::Failed) {
+                            finished = true;
+                        }
                         break;
                     }
                 }
@@ -2655,7 +2689,13 @@ mod tests {
                 let sse = [
                     lifecycle_frame(1, "queued", None, None, None),
                     lifecycle_frame(2, "progress", Some("processing ไทย"), None, None),
-                    lifecycle_frame(3, self.terminal, None, Some("finished"), Some("fixture")),
+                    lifecycle_frame(
+                        3,
+                        self.terminal,
+                        None,
+                        (self.terminal == "completed").then_some("finished"),
+                        (self.terminal == "failed").then_some("fixture"),
+                    ),
                 ]
                 .concat();
                 Ok(Box::new(FragmentedReader {
@@ -2732,7 +2772,22 @@ mod tests {
                     }
                     Ok(BoundChildMessage::Lifecycle(event)) if event.name == terminal => {
                         assert_eq!(event.id, Some(3));
-                        assert_eq!(event.data["result"], "finished");
+                        assert_eq!(
+                            event.data["result"],
+                            if terminal == "completed" {
+                                json!("finished")
+                            } else {
+                                json!(null)
+                            }
+                        );
+                        assert_eq!(
+                            event.data["error_code"],
+                            if terminal == "failed" {
+                                json!("fixture")
+                            } else {
+                                json!(null)
+                            }
+                        );
                         tracker.terminal = observe_child_lifecycle(&mut tracker, &event);
                         lifecycle_done = true;
                     }
@@ -3014,6 +3069,38 @@ mod tests {
     }
 
     #[test]
+    fn parent_receiver_error_keeps_child_tracking_until_terminal_confirmation() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Err(ChatFailure::Connection)).unwrap();
+        drop(sender);
+        let (_child_sender, child_receiver) = mpsc::channel();
+        let mut child_tracker = BoundChildTracker {
+            receiver: child_receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            terminal: false,
+        };
+        let mut parent_pump = ParentEventPump::default();
+
+        assert!(matches!(
+            parent_pump.poll(&receiver, true),
+            ParentEventPoll::Event(Err(ChatFailure::Connection))
+        ));
+        // This is the same failure latch called by interactive() for both
+        // StreamEvent::Err and ChatState::apply errors.
+        assert!(matches!(
+            parent_pump.fail(!child_tracker.terminal),
+            ParentEventPoll::WaitingForChild
+        ));
+        assert!(!child_tracker.terminal);
+
+        child_tracker.terminal = true;
+        assert!(matches!(
+            parent_pump.poll(&receiver, !child_tracker.terminal),
+            ParentEventPoll::Failed
+        ));
+    }
+
+    #[test]
     fn child_lifecycle_decoder_rejects_cursor_kind_and_dto_mismatches() {
         let payload = json!({
             "seq": 2,
@@ -3067,6 +3154,7 @@ mod tests {
             ParentEventPoll::Empty => "empty",
             ParentEventPoll::WaitingForChild => "waiting_for_child",
             ParentEventPoll::Disconnected => "disconnected",
+            ParentEventPoll::Failed => "failed",
         }
     }
 
