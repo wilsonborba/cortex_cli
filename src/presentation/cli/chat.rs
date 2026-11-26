@@ -125,6 +125,101 @@ fn cancel_voice_capture<T>(capture: &mut Option<T>) -> bool {
     capture.take().is_some()
 }
 
+fn start_recording<C>(
+    recording: &mut Option<(C, Instant, bool)>,
+    last_repeat: &mut Option<Instant>,
+    capture: C,
+    now: Instant,
+    reports_key_releases: bool,
+) {
+    *recording = Some((capture, now, reports_key_releases));
+    *last_repeat = (!reports_key_releases).then_some(now);
+}
+
+fn handle_space_repeat<C, E>(
+    recording: &mut Option<(C, Instant, bool)>,
+    pending_space: &mut Option<Instant>,
+    last_repeat: &mut Option<Instant>,
+    now: Instant,
+    reports_key_releases: bool,
+    start: impl FnOnce() -> Result<C, E>,
+) -> Result<bool, E> {
+    if recording.is_some() {
+        repeat_recording(recording, last_repeat, now);
+        return Ok(false);
+    }
+    if let Some(pending) = *pending_space {
+        if now.duration_since(pending) >= KITTY_HOLD_THRESHOLD {
+            let capture = start()?;
+            start_recording(recording, last_repeat, capture, now, reports_key_releases);
+            *pending_space = None;
+            return Ok(true);
+        }
+    } else {
+        *pending_space = Some(now);
+    }
+    Ok(false)
+}
+
+fn repeat_recording<C>(
+    recording: &Option<(C, Instant, bool)>,
+    last_repeat: &mut Option<Instant>,
+    now: Instant,
+) {
+    if recording
+        .as_ref()
+        .is_some_and(|(_, _, hold_mode)| !hold_mode)
+    {
+        *last_repeat = Some(now);
+    }
+}
+
+fn release_recording<C>(recording: &mut Option<(C, Instant, bool)>) -> Option<C> {
+    if recording
+        .as_ref()
+        .is_some_and(|(_, _, hold_mode)| *hold_mode)
+    {
+        recording.take().map(|(capture, _, _)| capture)
+    } else {
+        None
+    }
+}
+
+fn flush_pending_space(
+    pending_space: &mut Option<Instant>,
+    editor: &mut Editor,
+    now: Instant,
+    reports_key_releases: bool,
+) -> bool {
+    let Some(pending) = pending_space.take() else {
+        return false;
+    };
+    if !reports_key_releases || now.duration_since(pending) < KITTY_HOLD_THRESHOLD {
+        editor.insert(" ");
+        true
+    } else {
+        false
+    }
+}
+
+fn pause_recording<C, R, E>(
+    recording: &mut Option<(C, Instant, bool)>,
+    last_repeat: &mut Option<Instant>,
+    now: Instant,
+    transcribe: impl FnOnce(C) -> Result<R, E>,
+) -> Option<Result<R, E>> {
+    let due = recording.as_ref().is_some_and(|(_, _, hold_mode)| {
+        !hold_mode
+            && last_repeat.is_some_and(|last| now.duration_since(last) >= FALLBACK_RELEASE_TIMEOUT)
+    });
+    if !due {
+        return None;
+    }
+    let (capture, _, _) = recording.take().expect("due capture exists");
+    *last_repeat = None;
+    Some(transcribe(capture))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VoiceKeyAction {
     Cancel,
@@ -380,7 +475,9 @@ fn interactive<G: ChatApi + 'static>(
             if reports_key_releases && now.duration_since(pending) >= KITTY_HOLD_THRESHOLD {
                 pending_space = None;
                 match crate::dal::local::voice::Recorder::start() {
-                    Ok(recorder) => recording = Some((recorder, now, true)),
+                    Ok(recorder) => {
+                        start_recording(&mut recording, &mut last_repeat, recorder, now, true)
+                    }
                     Err(error) => voice_status = Some(error.to_string()),
                 }
             } else if !reports_key_releases && now.duration_since(pending) >= FALLBACK_TAP_TIMEOUT {
@@ -389,24 +486,24 @@ fn interactive<G: ChatApi + 'static>(
                 dirty = true;
             }
         }
-        if let Some((_, started_at, fallback)) = recording.as_ref() {
+        if let Some((_, started_at, _)) = recording.as_ref() {
             voice_status = Some(format!(
                 "● Recording locally  {:.1}s  Esc cancels",
                 started_at.elapsed().as_secs_f64()
             ));
-            if *fallback
-                && last_repeat
-                    .is_some_and(|last| now.duration_since(last) >= FALLBACK_RELEASE_TIMEOUT)
-            {
-                let (recorder, _, _) = recording.take().expect("recording is present");
-                last_repeat = None;
-                match transcribe_in_background(recorder) {
-                    Ok(job) => {
-                        voice_job = Some(job);
-                        voice_status = Some("Transcribing locally...".into());
-                    }
-                    Err(error) => voice_status = Some(error.to_string()),
+        }
+        if let Some(result) = pause_recording(
+            &mut recording,
+            &mut last_repeat,
+            now,
+            transcribe_in_background,
+        ) {
+            match result {
+                Ok(job) => {
+                    voice_job = Some(job);
+                    voice_status = Some("Transcribing locally...".into());
                 }
+                Err(error) => voice_status = Some(error.to_string()),
             }
         }
         if let Some(job) = voice_job.as_ref() {
@@ -506,7 +603,7 @@ fn interactive<G: ChatApi + 'static>(
                     && reports_key_releases
                     && key.code == KeyCode::Char(' ') =>
             {
-                if let Some((recorder, _, true)) = recording.take() {
+                if let Some(recorder) = release_recording(&mut recording) {
                     match transcribe_in_background(recorder) {
                         Ok(job) => {
                             voice_job = Some(job);
@@ -525,33 +622,25 @@ fn interactive<G: ChatApi + 'static>(
                     && key.code == KeyCode::Char(' ') =>
             {
                 let now = Instant::now();
-                if let Some((_, _, true)) = recording.as_ref() {
-                    continue;
-                }
-                if let Some((_, _, false)) = recording.as_ref() {
-                    last_repeat = Some(now);
-                } else if let Some(pending) = pending_space {
-                    if now.duration_since(pending) >= KITTY_HOLD_THRESHOLD {
-                        match crate::dal::local::voice::Recorder::start() {
-                            Ok(recorder) => {
-                                recording = Some((recorder, now, false));
-                                last_repeat = Some(now);
-                            }
-                            Err(error) => voice_status = Some(error.to_string()),
-                        }
-                        pending_space = None;
-                    }
-                } else {
-                    pending_space = Some(now);
+                match handle_space_repeat(
+                    &mut recording,
+                    &mut pending_space,
+                    &mut last_repeat,
+                    now,
+                    reports_key_releases,
+                    crate::dal::local::voice::Recorder::start,
+                ) {
+                    Ok(_) => {}
+                    Err(error) => voice_status = Some(error.to_string()),
                 }
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if let Some(pending) = pending_space.take()
-                    && (!reports_key_releases
-                        || Instant::now().duration_since(pending) < KITTY_HOLD_THRESHOLD)
-                {
-                    editor.insert(" ");
-                }
+                flush_pending_space(
+                    &mut pending_space,
+                    &mut editor,
+                    Instant::now(),
+                    reports_key_releases,
+                );
                 let control = key.modifiers.contains(KeyModifiers::CONTROL);
                 if control && matches!(key.code, KeyCode::Char('o' | 'O')) {
                     expanded = !expanded;
@@ -674,6 +763,13 @@ mod tests {
         dropped: Arc<std::sync::atomic::AtomicBool>,
     }
 
+    struct FakeCapture(Arc<std::sync::atomic::AtomicUsize>);
+
+    fn transcribe_fake(capture: FakeCapture) -> Result<&'static str, ()> {
+        capture.0.fetch_add(1, Ordering::SeqCst);
+        Ok("editable transcript")
+    }
+
     impl Drop for CaptureProbe {
         fn drop(&mut self) {
             crate::dal::local::voice::clear_audio_samples(&mut self.samples);
@@ -791,6 +887,118 @@ mod tests {
         assert_eq!(editor.text, transcript);
         assert_eq!(editor.cursor, transcript.len());
         assert_eq!(SENDS.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fallback_repeat_pause_stops_once_and_transcribes_into_editable_text() {
+        let t0 = Instant::now();
+        let started = t0 + KITTY_HOLD_THRESHOLD;
+        let repeated = started + Duration::from_millis(40);
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut recording = None;
+        let mut pending_space = Some(t0);
+        let mut last_repeat = None;
+
+        assert!(
+            handle_space_repeat(
+                &mut recording,
+                &mut pending_space,
+                &mut last_repeat,
+                started,
+                false,
+                || Ok::<_, ()>(FakeCapture(stops.clone()))
+            )
+            .unwrap()
+        );
+        assert!(recording.is_some());
+        assert_eq!(last_repeat, Some(started));
+
+        assert!(
+            !handle_space_repeat(
+                &mut recording,
+                &mut pending_space,
+                &mut last_repeat,
+                repeated,
+                false,
+                || -> Result<FakeCapture, ()> {
+                    panic!("a repeat must not start a second recorder")
+                }
+            )
+            .unwrap()
+        );
+        assert_eq!(last_repeat, Some(repeated));
+        assert!(
+            pause_recording(
+                &mut recording,
+                &mut last_repeat,
+                repeated + FALLBACK_RELEASE_TIMEOUT - Duration::from_millis(1),
+                transcribe_fake,
+            )
+            .is_none()
+        );
+
+        let transcript = pause_recording(
+            &mut recording,
+            &mut last_repeat,
+            repeated + FALLBACK_RELEASE_TIMEOUT,
+            transcribe_fake,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(transcript, "editable transcript");
+        let mut editor = Editor::default();
+        insert_voice_transcript(&mut editor, transcript);
+        assert_eq!(editor.text, "editable transcript");
+        assert_eq!(editor.cursor, editor.text.len());
+        assert!(recording.is_none());
+        assert_eq!(last_repeat, None);
+        assert!(
+            pause_recording(
+                &mut recording,
+                &mut last_repeat,
+                repeated + FALLBACK_RELEASE_TIMEOUT + Duration::from_secs(1),
+                transcribe_fake,
+            )
+            .is_none()
+        );
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn kitty_release_stops_capture_and_quick_space_stays_text() {
+        let t0 = Instant::now();
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut recording = None;
+        let mut pending_space = Some(t0);
+        let mut last_repeat = None;
+        assert!(
+            handle_space_repeat(
+                &mut recording,
+                &mut pending_space,
+                &mut last_repeat,
+                t0 + KITTY_HOLD_THRESHOLD,
+                true,
+                || Ok::<_, ()>(FakeCapture(stops.clone()))
+            )
+            .unwrap()
+        );
+        assert_eq!(last_repeat, None);
+        assert_eq!(
+            transcribe_fake(release_recording(&mut recording).unwrap()),
+            Ok("editable transcript")
+        );
+        assert!(recording.is_none());
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+
+        let mut editor = Editor::default();
+        let mut quick_tap = Some(t0);
+        assert!(flush_pending_space(
+            &mut quick_tap,
+            &mut editor,
+            t0 + Duration::from_millis(100),
+            false
+        ));
+        assert_eq!(editor.text, " ");
     }
 
     #[test]
