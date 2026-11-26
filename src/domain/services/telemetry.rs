@@ -96,6 +96,18 @@ impl Telemetry {
                 crate::domain::models::chat::ChatFailure::InvalidInput => {
                     ("invalid_input", "Chat request input was invalid.")
                 }
+                crate::domain::models::chat::ChatFailure::SourceUnavailable => (
+                    "source_unavailable",
+                    "Selected source context is unavailable.",
+                ),
+                crate::domain::models::chat::ChatFailure::PartialNoteContextNonInteractive => (
+                    "partial_note_context_non_interactive",
+                    "Selected note context required interactive review.",
+                ),
+                crate::domain::models::chat::ChatFailure::NoteHasNoTypedText => (
+                    "note_has_no_typed_text",
+                    "Selected note had no usable typed text.",
+                ),
                 crate::domain::models::chat::ChatFailure::RunningOutput => {
                     ("running_output", "Chat already had a running output.")
                 }

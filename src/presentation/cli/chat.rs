@@ -12,16 +12,21 @@ use crate::{
     },
     dal::{
         local::{session::OsSessionStore, telemetry_consent::OsTelemetryConsentStore},
-        remote::{chat::CortexClient, gateway::GatewayClient, login_context, sse::SseFrameDecoder},
+        remote::{
+            annotations::AnnotationsClient, chat::CortexClient, gateway::GatewayClient,
+            login_context, sse::SseFrameDecoder,
+        },
     },
     domain::{
         models::{
+            annotations::SelectedContext,
             chat::{ChatFailure, ChatPage, StreamEvent, valid_id},
             native_auth::{AuthFailure, Session},
             remote_control::{RemoteEvent, RemoteEventKind},
             tools::{ToolName, ToolResult},
         },
         services::{
+            annotations::{selected_context, upload_context},
             auth::AuthService,
             chat::{ChatApi, ChatState, follow, latest_chat, owned_history, running_output},
             remote_control::reconnect_delay,
@@ -1951,7 +1956,30 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
     if options.prompt.is_none() && (!io::stdin().is_terminal() || !io::stdout().is_terminal()) {
         return out.write_all(super::formatters::help().as_bytes());
     }
+    if !options.note_ids.is_empty() && !settings::ANNOTATIONS_SOURCE_ENABLED {
+        return Err(failure(ChatFailure::SourceUnavailable));
+    }
     let signed_in = session()?;
+    let context = if options.note_ids.is_empty() {
+        SelectedContext {
+            text: String::new(),
+            omissions: Vec::new(),
+        }
+    } else {
+        let notes = AnnotationsClient::new(signed_in.clone()).map_err(failure)?;
+        selected_context(&notes, &options.note_ids).map_err(failure)?
+    };
+    if let Some(notice) = context.omission_notice() {
+        writeln!(out, "{notice}")?;
+        if options.prompt.is_some() {
+            return Err(failure(ChatFailure::PartialNoteContextNonInteractive));
+        }
+        writeln!(
+            out,
+            "Only selected typed text and note titles will be attached."
+        )?;
+        out.flush()?;
+    }
     let telemetry = telemetry_for(&signed_in);
     let api = Arc::new(CortexClient::new(signed_in).map_err(failure)?);
     let chat = if options.continue_latest {
@@ -1978,12 +2006,18 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
         {
             return Err(failure(ChatFailure::RunningOutput));
         }
+        let files = upload_context(&context, false, |document| {
+            api.upload_temporary_text("selected-annotations.txt", document)
+        })
+        .map_err(failure)?;
         let mut state = ChatState {
             chat_id: chat.clone(),
             ..Default::default()
         };
         let mut text = TerminalText::default();
-        let stream = api.send(chat.as_deref(), &prompt).map_err(failure)?;
+        let stream = api
+            .send_with_files(chat.as_deref(), &prompt, &files)
+            .map_err(failure)?;
         let result = follow(api.as_ref(), stream, &mut state, |event| {
             if event.name == "token" {
                 out.write_all(
@@ -2002,7 +2036,23 @@ pub fn execute(options: ChatOptions, out: &mut impl Write) -> io::Result<()> {
         return writeln!(out);
     }
     let remote_api = options.remote_control.then(|| api.clone());
-    interactive(api, chat, history, telemetry, out, remote_api)
+    interactive(api, chat, history, telemetry, out, remote_api, context)
+}
+
+fn selected_context_files_for_submission(
+    api: &dyn ChatApi,
+    context: &SelectedContext,
+    prompt: &str,
+    uploaded: &mut bool,
+) -> Result<Vec<String>, ChatFailure> {
+    if prompt.trim().is_empty() || *uploaded {
+        return Ok(Vec::new());
+    }
+    let files = upload_context(context, true, |document| {
+        api.upload_temporary_text("selected-annotations.txt", document)
+    })?;
+    *uploaded = true;
+    Ok(files)
 }
 
 fn telemetry_for(session: &Arc<Session>) -> Option<Arc<Telemetry>> {
@@ -2058,6 +2108,7 @@ fn interactive<G: ChatApi + 'static>(
     telemetry: Option<Arc<Telemetry>>,
     out: &mut impl Write,
     remote_api: Option<Arc<CortexClient>>,
+    context: SelectedContext,
 ) -> io::Result<()> {
     let remote = remote_api
         .map(|remote_api| RemoteSessionGuard::start(remote_api, out))
@@ -2097,6 +2148,7 @@ fn interactive<G: ChatApi + 'static>(
         .as_ref()
         .map(|_| RemoteTurnContext::new(running.as_deref()));
     let mut editor = Editor::default();
+    let mut context_uploaded = context.text.is_empty();
     let mut expanded = false;
     let mut receiver: Option<mpsc::Receiver<Result<StreamEvent, ChatFailure>>> = None;
     let mut parent_pump = ParentEventPump::default();
@@ -2733,6 +2785,18 @@ fn interactive<G: ChatApi + 'static>(
                         };
                         cleaner = TerminalText::default();
                         started = Some(Instant::now());
+                        let file_ids = match selected_context_files_for_submission(
+                            api.as_ref(),
+                            &context,
+                            &text,
+                            &mut context_uploaded,
+                        ) {
+                            Ok(files) => files,
+                            Err(error) => {
+                                surface.text(out, &format!("\n{error}\n"))?;
+                                continue;
+                            }
+                        };
                         active_remote_turn = remote_publisher
                             .as_ref()
                             .map(|_| RemoteTurnContext::new(None));
@@ -2740,7 +2804,7 @@ fn interactive<G: ChatApi + 'static>(
                             api.clone(),
                             chat.clone(),
                             text,
-                            Vec::new(),
+                            file_ids,
                             remote_publisher.clone(),
                             active_remote_turn.clone(),
                             telemetry.clone(),
@@ -2776,6 +2840,7 @@ mod tests {
     };
     pub(super) static DETAIL_STATES: std::sync::Mutex<Vec<bool>> =
         std::sync::Mutex::new(Vec::new());
+    static CONTEXT_UPLOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static CANCELLATIONS: std::sync::Mutex<Vec<(String, String)>> =
         std::sync::Mutex::new(Vec::new());
     type SubmittedToolResult = (String, String, String, String, String);
@@ -4430,6 +4495,10 @@ mod tests {
         }
     }
     impl ChatApi for Fixture {
+        fn upload_temporary_text(&self, _: &str, _: &str) -> Result<String, ChatFailure> {
+            CONTEXT_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("10000000-0000-4000-8000-000000000001".into())
+        }
         fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
             SENDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let steps = [
@@ -4743,7 +4812,19 @@ mod tests {
         assert!(io::stdin().is_terminal());
         let mut out = io::stdout().lock();
         write!(out, "\x1b[2J\x1b[H").unwrap();
-        interactive(Arc::new(Fixture), None, None, None, &mut out, None).unwrap();
+        interactive(
+            Arc::new(Fixture),
+            None,
+            None,
+            None,
+            &mut out,
+            None,
+            SelectedContext {
+                text: String::new(),
+                omissions: Vec::new(),
+            },
+        )
+        .unwrap();
         assert_eq!(*DETAIL_STATES.lock().unwrap(), vec![true, false]);
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     }
@@ -4752,7 +4833,19 @@ mod tests {
     fn terminal_cancel_fixture() {
         assert!(io::stdin().is_terminal());
         let mut out = io::stdout().lock();
-        interactive(Arc::new(Fixture), None, None, None, &mut out, None).unwrap();
+        interactive(
+            Arc::new(Fixture),
+            None,
+            None,
+            None,
+            &mut out,
+            None,
+            SelectedContext {
+                text: String::new(),
+                omissions: Vec::new(),
+            },
+        )
+        .unwrap();
         assert_eq!(
             *CANCELLATIONS.lock().unwrap(),
             vec![(
@@ -4761,5 +4854,34 @@ mod tests {
             )]
         );
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
+    }
+
+    #[test]
+    fn selected_context_upload_waits_for_first_nonempty_prompt_submission() {
+        CONTEXT_UPLOADS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let api = Fixture;
+        let context = SelectedContext {
+            text: "selected typed note".into(),
+            omissions: Vec::new(),
+        };
+        let mut uploaded = false;
+        assert!(
+            selected_context_files_for_submission(&api, &context, "", &mut uploaded)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(CONTEXT_UPLOADS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            selected_context_files_for_submission(&api, &context, "first prompt", &mut uploaded)
+                .unwrap(),
+            ["10000000-0000-4000-8000-000000000001"]
+        );
+        assert_eq!(CONTEXT_UPLOADS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            selected_context_files_for_submission(&api, &context, "second prompt", &mut uploaded)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(CONTEXT_UPLOADS.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
