@@ -323,6 +323,7 @@ struct RemoteTurnPublisher {
 struct RemoteTurnState {
     turn_id: Option<String>,
     outcome: Option<RemoteTurnOutcome>,
+    terminal_taken: bool,
 }
 
 enum RemoteTurnOutcome {
@@ -342,6 +343,7 @@ impl RemoteTurnContext {
             state: Arc::new(Mutex::new(RemoteTurnState {
                 turn_id,
                 outcome: None,
+                terminal_taken: false,
             })),
         }
     }
@@ -385,8 +387,17 @@ impl RemoteTurnContext {
 
     fn record(&self, outcome: RemoteTurnOutcome) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.outcome.is_none() {
+        if !state.terminal_taken && state.outcome.is_none() {
             state.outcome = Some(outcome);
+        }
+    }
+
+    fn ensure_terminal_outcome(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.terminal_taken && state.outcome.is_none() {
+            state.outcome = Some(RemoteTurnOutcome::Incomplete(
+                "The turn ended before a stream outcome was received.".into(),
+            ));
         }
     }
 
@@ -402,7 +413,11 @@ impl RemoteTurnContext {
 
     fn take_terminal(&self) -> Option<Value> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.terminal_taken {
+            return None;
+        }
         let outcome = state.outcome.take()?;
+        state.terminal_taken = true;
         let mut payload = match outcome {
             RemoteTurnOutcome::Complete {
                 session_id,
@@ -468,6 +483,9 @@ fn cleanup_remote_turn(
         child_tracker,
         child_state,
     ) {
+        if let Some(context) = context {
+            context.ensure_terminal_outcome();
+        }
         publish_turn_terminal(publisher, context);
         true
     } else {
@@ -3637,6 +3655,362 @@ mod tests {
                 if payload["turn_id"] == OUTPUT && payload["status"] == "complete"
         ));
         assert!(publish_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn send_failure_before_stream_publishes_one_unbound_terminal_at_common_cleanup() {
+        struct SendErrorApi;
+        impl ChatApi for SendErrorApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::Connection)
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(&self, _: &str) -> Result<ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::Connection)
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+        }
+
+        let (publish_sender, publish_receiver) = mpsc::sync_channel(8);
+        let publisher = RemotePublisher {
+            sender: publish_sender,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let context = RemoteTurnContext::new(None);
+        let mut receiver = Some(begin_turn_with_context(
+            Arc::new(SendErrorApi),
+            None,
+            "unaccepted prompt".into(),
+            Vec::new(),
+            Some(publisher.clone()),
+            Some(context.clone()),
+            None,
+        ));
+        let mut parent_pump = ParentEventPump::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let failure = loop {
+            match parent_pump.poll(receiver.as_ref().unwrap(), false) {
+                ParentEventPoll::Event(Err(error)) => break error,
+                ParentEventPoll::Empty if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                other => panic!(
+                    "expected pre-stream send failure, got {}",
+                    poll_name(&other)
+                ),
+            }
+        };
+        assert_eq!(failure, ChatFailure::Connection);
+        assert!(matches!(parent_pump.fail(false), ParentEventPoll::Failed));
+        assert!(context.turn_id().is_none());
+
+        let mut finish_pending = false;
+        let mut child_tracker = None;
+        let mut child_state = None;
+        assert!(cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(receiver.is_none());
+        assert!(matches!(
+            publish_receiver.try_recv(),
+            Ok(PublishMessage::Event(RemoteEventKind::TurnEnd, payload))
+                if payload["status"] == "incomplete"
+                    && payload.get("turn_id").is_none()
+        ));
+        assert!(cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(
+            publish_receiver.try_recv().is_err(),
+            "terminal is emitted once"
+        );
+    }
+
+    #[test]
+    fn reconnect_failure_publishes_bound_incomplete_terminal_at_common_cleanup() {
+        const CHAT: &str = "10000000-0000-4000-8000-000000000001";
+        const OUTPUT: &str = "20000000-0000-4000-8000-000000000002";
+
+        struct ReconnectErrorApi;
+        impl ChatApi for ReconnectErrorApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(&self, _: &str) -> Result<ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::Connection)
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+        }
+
+        let (publish_sender, publish_receiver) = mpsc::sync_channel(8);
+        let publisher = RemotePublisher {
+            sender: publish_sender,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let context = RemoteTurnContext::new(Some(OUTPUT));
+        let (sender, receiver) = mpsc::channel();
+        spawn_reconnect_turn(
+            Arc::new(ReconnectErrorApi),
+            CHAT.into(),
+            OUTPUT.into(),
+            Some(publisher.clone()),
+            Some(context.clone()),
+            None,
+            sender,
+        );
+        let mut receiver = Some(receiver);
+        let mut parent_pump = ParentEventPump::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match parent_pump.poll(receiver.as_ref().unwrap(), false) {
+                ParentEventPoll::Event(Err(ChatFailure::Connection)) => break,
+                ParentEventPoll::Empty if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                other => panic!("expected reconnect failure, got {}", poll_name(&other)),
+            }
+        }
+        assert!(matches!(parent_pump.fail(false), ParentEventPoll::Failed));
+        assert_eq!(context.turn_id().as_deref(), Some(OUTPUT));
+
+        let mut finish_pending = false;
+        let mut child_tracker = None;
+        let mut child_state = None;
+        assert!(cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(receiver.is_none());
+        assert!(matches!(
+            publish_receiver.try_recv(),
+            Ok(PublishMessage::Event(RemoteEventKind::TurnEnd, payload))
+                if payload["turn_id"] == OUTPUT && payload["status"] == "incomplete"
+        ));
+        assert!(publish_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn tool_result_submit_failure_waits_for_live_child_before_fallback_terminal() {
+        use std::sync::atomic::{AtomicBool as TestAtomicBool, AtomicUsize};
+
+        const REMOTE: &str = "40000000-0000-4000-8000-000000000004";
+        const CHILD: &str = "50000000-0000-4000-8000-000000000005";
+        const CHAT: &str = "10000000-0000-4000-8000-000000000001";
+        const OUTPUT: &str = "20000000-0000-4000-8000-000000000002";
+        const CHILD_CHAT: &str = "60000000-0000-4000-8000-000000000006";
+        const CHILD_OUTPUT: &str = "70000000-0000-4000-8000-000000000007";
+        const CALL: &str = "30000000-0000-4000-8000-000000000003";
+
+        struct LiveChildApi {
+            terminal: TestAtomicBool,
+            detail_reads: AtomicUsize,
+        }
+        impl ChatApi for LiveChildApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(&self, _: &str) -> Result<ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                Ok(())
+            }
+            fn bound_child_events(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Ok(Box::new(Cursor::new(Vec::<u8>::new())))
+            }
+            fn bound_child_detail(
+                &self,
+                _: &str,
+                child: &str,
+            ) -> Result<crate::domain::services::chat::BoundChildDetail, ChatFailure> {
+                self.detail_reads.fetch_add(1, Ordering::AcqRel);
+                Ok(crate::domain::services::chat::BoundChildDetail {
+                    child_id: child.into(),
+                    parent_chat_session_id: Some(CHAT.into()),
+                    parent_output_id: Some(OUTPUT.into()),
+                    parent_call_id: Some(CALL.into()),
+                    child_chat_session_id: Some(CHILD_CHAT.into()),
+                    child_output_id: Some(CHILD_OUTPUT.into()),
+                    status: if self.terminal.load(Ordering::Acquire) {
+                        "completed"
+                    } else {
+                        "running"
+                    }
+                    .into(),
+                })
+            }
+        }
+
+        let api = Arc::new(LiveChildApi {
+            terminal: TestAtomicBool::new(false),
+            detail_reads: AtomicUsize::new(0),
+        });
+        let mut child_tracker = Some(begin_bound_child_tracker(
+            api.clone(),
+            REMOTE.into(),
+            CHILD.into(),
+            CHAT.into(),
+            OUTPUT.into(),
+            CALL.into(),
+        ));
+        let detail_deadline = Instant::now() + Duration::from_secs(2);
+        while api.detail_reads.load(Ordering::Acquire) == 0 && Instant::now() < detail_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(api.detail_reads.load(Ordering::Acquire) > 0);
+
+        let request = crate::domain::models::tools::ToolRequest::from_event(&json!({
+            "call_id":"30000000-0000-4000-8000-000000000009",
+            "name":"view_file",
+            "arguments":{"path":"Cargo.toml","start_line":1}
+        }))
+        .unwrap();
+        let mut state = ChatState {
+            chat_id: Some(CHAT.into()),
+            output_id: Some(OUTPUT.into()),
+            child_id: Some(CHILD.into()),
+            child_call_id: Some(CALL.into()),
+            tool_request: Some(request),
+            ..Default::default()
+        };
+        assert!(submit_tool_call(api.as_ref(), &mut state, Some(REMOTE), true).is_err());
+
+        let (publish_sender, publish_receiver) = mpsc::sync_channel(8);
+        let publisher = RemotePublisher {
+            sender: publish_sender,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let context = RemoteTurnContext::new(Some(OUTPUT));
+        let (parent_sender, parent_receiver) = mpsc::channel();
+        drop(parent_sender);
+        let mut receiver = Some(parent_receiver);
+        let mut parent_pump = ParentEventPump::default();
+        assert!(matches!(
+            parent_pump.fail(true),
+            ParentEventPoll::WaitingForChild
+        ));
+        let mut finish_pending = false;
+        let mut child_state = Some(ChatState::default());
+        assert!(!cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(receiver.is_some());
+        assert!(child_tracker.is_some());
+        assert!(publish_receiver.try_recv().is_err());
+
+        api.terminal.store(true, Ordering::Release);
+        let terminal_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < terminal_deadline && !child_tracker.as_ref().unwrap().terminal {
+            match child_tracker
+                .as_ref()
+                .unwrap()
+                .receiver
+                .recv_timeout(Duration::from_millis(50))
+            {
+                Ok(BoundChildMessage::ConfirmedTerminal(status)) => {
+                    assert_eq!(status, "completed");
+                    child_tracker.as_mut().unwrap().terminal = true;
+                }
+                Ok(BoundChildMessage::Lifecycle(event)) => {
+                    let tracker = child_tracker.as_mut().unwrap();
+                    tracker.terminal = observe_child_lifecycle(tracker, &event);
+                }
+                Ok(
+                    BoundChildMessage::Error(_)
+                    | BoundChildMessage::Bound(_, _)
+                    | BoundChildMessage::Output(_),
+                )
+                | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(child_tracker.as_ref().unwrap().terminal);
+        assert!(matches!(parent_pump.fail(false), ParentEventPoll::Failed));
+        assert!(cleanup_remote_turn(
+            &mut finish_pending,
+            true,
+            &mut receiver,
+            &mut child_tracker,
+            &mut child_state,
+            Some(&publisher),
+            Some(&context),
+        ));
+        assert!(receiver.is_none());
+        assert!(child_tracker.is_none());
+        assert!(child_state.is_none());
+        assert!(matches!(
+            publish_receiver.try_recv(),
+            Ok(PublishMessage::Event(RemoteEventKind::TurnEnd, payload))
+                if payload["turn_id"] == OUTPUT && payload["status"] == "incomplete"
+        ));
+        assert!(
+            publish_receiver.try_recv().is_err(),
+            "terminal is emitted once"
+        );
     }
 
     #[test]
