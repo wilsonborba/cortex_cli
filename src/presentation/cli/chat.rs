@@ -12,7 +12,7 @@ use crate::{
     },
     dal::{
         local::{session::OsSessionStore, telemetry_consent::OsTelemetryConsentStore},
-        remote::{chat::CortexClient, gateway::GatewayClient, login_context},
+        remote::{chat::CortexClient, gateway::GatewayClient, login_context, sse::SseFrameDecoder},
     },
     domain::{
         models::{
@@ -777,6 +777,7 @@ enum BoundChildMessage {
     Bound(String, String),
     Output(StreamEvent),
     Lifecycle(StreamEvent),
+    ConfirmedTerminal(String),
     Error(ChatFailure),
 }
 
@@ -784,6 +785,160 @@ struct BoundChildTracker {
     receiver: mpsc::Receiver<BoundChildMessage>,
     stop: Arc<AtomicBool>,
     terminal: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildRunEvent {
+    seq: u64,
+    event_id: String,
+    kind: String,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    message: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    result: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    error_code: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    action_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    action_kind: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    payload_digest: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    display: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    approved: Option<bool>,
+    created_at: String,
+}
+
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
+
+fn decode_child_lifecycle_frame(
+    frame: crate::dal::remote::sse::SseFrame,
+    after: u64,
+) -> Result<StreamEvent, ChatFailure> {
+    if frame.name == "error" {
+        return Err(ChatFailure::Connection);
+    }
+    let event: ChildRunEvent =
+        serde_json::from_slice(&frame.data).map_err(|_| ChatFailure::InvalidResponse)?;
+    let valid_kind = matches!(
+        event.kind.as_str(),
+        "queued"
+            | "progress"
+            | "completed"
+            | "failed"
+            | "cancel_requested"
+            | "cancelled"
+            | "action_requested"
+            | "action_answered"
+    );
+    if frame.id != Some(event.seq)
+        || event.seq <= after
+        || frame.name != event.kind
+        || !valid_kind
+        || !valid_id(&event.event_id)
+        || event.created_at.is_empty()
+        || event.created_at.len() > 64
+        || event
+            .message
+            .as_ref()
+            .is_some_and(|value| value.len() > 64_000)
+        || event
+            .result
+            .as_ref()
+            .is_some_and(|value| value.len() > 64_000)
+        || event
+            .error_code
+            .as_ref()
+            .is_some_and(|value| value.len() > 128)
+        || event
+            .action_id
+            .as_ref()
+            .is_some_and(|value| !valid_id(value))
+        || event
+            .action_kind
+            .as_ref()
+            .is_some_and(|value| value.len() > 128)
+        || event
+            .payload_digest
+            .as_ref()
+            .is_some_and(|value| value.len() > 128)
+        || event
+            .display
+            .as_ref()
+            .is_some_and(|value| value.len() > 64_000)
+    {
+        return Err(ChatFailure::InvalidResponse);
+    }
+    let message = event.message.clone().unwrap_or_default();
+    let data = json!({
+        "seq": event.seq,
+        "event_id": event.event_id,
+        "kind": event.kind,
+        "message": event.message,
+        "result": event.result,
+        "error_code": event.error_code,
+        "action_id": event.action_id,
+        "action_kind": event.action_kind,
+        "payload_digest": event.payload_digest,
+        "display": event.display,
+        "approved": event.approved,
+        "created_at": event.created_at,
+    });
+    Ok(StreamEvent {
+        id: frame.id,
+        name: frame.name,
+        message,
+        data,
+    })
+}
+
+#[derive(Default)]
+struct ParentEventPump {
+    disconnected: bool,
+}
+
+enum ParentEventPoll {
+    Event(Result<StreamEvent, ChatFailure>),
+    Empty,
+    WaitingForChild,
+    Disconnected,
+}
+
+impl ParentEventPump {
+    fn poll(
+        &mut self,
+        receiver: &mpsc::Receiver<Result<StreamEvent, ChatFailure>>,
+        child_live: bool,
+    ) -> ParentEventPoll {
+        if self.disconnected {
+            return if child_live {
+                ParentEventPoll::WaitingForChild
+            } else {
+                ParentEventPoll::Disconnected
+            };
+        }
+        match receiver.try_recv() {
+            Ok(event) => ParentEventPoll::Event(event),
+            Err(mpsc::TryRecvError::Empty) => ParentEventPoll::Empty,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.disconnected = true;
+                if child_live {
+                    ParentEventPoll::WaitingForChild
+                } else {
+                    ParentEventPoll::Disconnected
+                }
+            }
+        }
+    }
 }
 
 fn verify_child_binding(
@@ -801,6 +956,28 @@ fn verify_child_binding(
         return Err(ChatFailure::InvalidResponse);
     }
     Ok(())
+}
+
+fn confirm_child_terminal(
+    api: &dyn ChatApi,
+    remote_session: &str,
+    child_id: &str,
+    parent_chat: &str,
+    parent_output: &str,
+    parent_call: &str,
+    sender: &mpsc::Sender<BoundChildMessage>,
+) -> bool {
+    let Ok(detail) = api.bound_child_detail(remote_session, child_id) else {
+        return false;
+    };
+    if verify_child_binding(&detail, child_id, parent_chat, parent_output, parent_call).is_err()
+        || !matches!(detail.status.as_str(), "completed" | "failed" | "cancelled")
+    {
+        return false;
+    }
+    sender
+        .send(BoundChildMessage::ConfirmedTerminal(detail.status))
+        .is_ok()
 }
 
 fn observe_child_lifecycle(tracker: &mut BoundChildTracker, event: &StreamEvent) -> bool {
@@ -836,38 +1013,107 @@ fn begin_bound_child_tracker<G: ChatApi + 'static>(
     let lifecycle_sender = sender.clone();
     let lifecycle_remote = remote_session.clone();
     let lifecycle_child = child_id.clone();
+    let lifecycle_parent_chat = parent_chat.clone();
+    let lifecycle_parent_output = parent_output.clone();
+    let lifecycle_parent_call = parent_call.clone();
     let lifecycle_stop = stop.clone();
     thread::spawn(move || {
-        let result = lifecycle_api
-            .bound_child_events(&lifecycle_remote, &lifecycle_child, 0)
-            .and_then(|mut stream| {
-                let mut decoder = crate::dal::remote::sse::SseDecoder::default();
-                let mut buffer = [0u8; 8192];
-                while !lifecycle_stop.load(Ordering::Acquire) {
-                    let count = stream
-                        .read(&mut buffer)
-                        .map_err(|_| ChatFailure::Connection)?;
-                    if count == 0 {
-                        return Ok(());
+        let mut after = 0;
+        let mut reported_error = false;
+        while !lifecycle_stop.load(Ordering::Acquire) {
+            let mut stream = match lifecycle_api.bound_child_events(
+                &lifecycle_remote,
+                &lifecycle_child,
+                after,
+            ) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    if !reported_error {
+                        let _ = lifecycle_sender.send(BoundChildMessage::Error(error));
+                        reported_error = true;
                     }
-                    for event in decoder.feed(&buffer[..count])? {
-                        let terminal =
-                            matches!(event.name.as_str(), "completed" | "failed" | "cancelled");
-                        if lifecycle_sender
-                            .send(BoundChildMessage::Lifecycle(event))
-                            .is_err()
-                        {
-                            return Ok(());
+                    if confirm_child_terminal(
+                        lifecycle_api.as_ref(),
+                        &lifecycle_remote,
+                        &lifecycle_child,
+                        &lifecycle_parent_chat,
+                        &lifecycle_parent_output,
+                        &lifecycle_parent_call,
+                        &lifecycle_sender,
+                    ) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+            };
+            let mut decoder = SseFrameDecoder::default();
+            let mut buffer = [0u8; 8192];
+            'stream: while !lifecycle_stop.load(Ordering::Acquire) {
+                let count = match stream.read(&mut buffer) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        if !reported_error {
+                            let _ = lifecycle_sender
+                                .send(BoundChildMessage::Error(ChatFailure::Connection));
+                            reported_error = true;
                         }
-                        if terminal {
-                            return Ok(());
+                        break;
+                    }
+                };
+                if count == 0 {
+                    break;
+                }
+                let frames = match decoder.feed(&buffer[..count]) {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        if !reported_error {
+                            let _ = lifecycle_sender.send(BoundChildMessage::Error(error));
+                            reported_error = true;
                         }
+                        break;
+                    }
+                };
+                for frame in frames {
+                    let event = match decode_child_lifecycle_frame(frame, after) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            if !reported_error {
+                                let _ = lifecycle_sender.send(BoundChildMessage::Error(error));
+                                reported_error = true;
+                            }
+                            break 'stream;
+                        }
+                    };
+                    after = event.id.unwrap_or(after);
+                    let terminal =
+                        matches!(event.name.as_str(), "completed" | "failed" | "cancelled");
+                    if lifecycle_sender
+                        .send(BoundChildMessage::Lifecycle(event))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if terminal {
+                        return;
                     }
                 }
-                Ok(())
-            });
-        if let Err(error) = result {
-            let _ = lifecycle_sender.send(BoundChildMessage::Error(error));
+            }
+            if lifecycle_stop.load(Ordering::Acquire) {
+                return;
+            }
+            if confirm_child_terminal(
+                lifecycle_api.as_ref(),
+                &lifecycle_remote,
+                &lifecycle_child,
+                &lifecycle_parent_chat,
+                &lifecycle_parent_output,
+                &lifecycle_parent_call,
+                &lifecycle_sender,
+            ) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(250));
         }
     });
 
@@ -1540,6 +1786,7 @@ fn interactive<G: ChatApi + 'static>(
     let mut editor = Editor::default();
     let mut expanded = false;
     let mut receiver: Option<mpsc::Receiver<Result<StreamEvent, ChatFailure>>> = None;
+    let mut parent_pump = ParentEventPump::default();
     let mut child_tracker: Option<BoundChildTracker> = None;
     let mut child_state: Option<ChatState> = None;
     let mut watched_child: Option<String> = None;
@@ -1561,6 +1808,7 @@ fn interactive<G: ChatApi + 'static>(
     if let (Some(chat_id), Some(output_id)) = (chat.clone(), running) {
         let (tx, rx) = mpsc::channel();
         receiver = Some(rx);
+        parent_pump = ParentEventPump::default();
         started = Some(Instant::now());
         let api = api.clone();
         let publisher = remote_publisher.clone();
@@ -1733,6 +1981,16 @@ fn interactive<G: ChatApi + 'static>(
                     }
                     dirty = true;
                 }
+                BoundChildMessage::ConfirmedTerminal(status) => {
+                    if let Some(tracker) = child_tracker.as_mut() {
+                        tracker.terminal = true;
+                    }
+                    surface.text(
+                        out,
+                        &format!("\nChild status confirmed by Cortex: {status}.\n"),
+                    )?;
+                    dirty = true;
+                }
                 BoundChildMessage::Error(error) => {
                     surface.text(out, &format!("\nChild stream error: {error}\n"))?;
                     dirty = true;
@@ -1796,12 +2054,17 @@ fn interactive<G: ChatApi + 'static>(
         if let Some(rx) = receiver.as_ref() {
             let mut finished = false;
             loop {
-                let result = match rx.try_recv() {
-                    Ok(value) => value,
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        surface.text(out, &format!("\n{}\n", ChatFailure::IncompleteStream))?;
-                        finished = true;
+                let child_live = child_tracker
+                    .as_ref()
+                    .is_some_and(|tracker| !tracker.terminal);
+                let result = match parent_pump.poll(rx, child_live) {
+                    ParentEventPoll::Event(value) => value,
+                    ParentEventPoll::Empty | ParentEventPoll::WaitingForChild => break,
+                    ParentEventPoll::Disconnected => {
+                        if !state.complete {
+                            surface.text(out, &format!("\n{}\n", ChatFailure::IncompleteStream))?;
+                            finished = true;
+                        }
                         break;
                     }
                 };
@@ -1915,6 +2178,7 @@ fn interactive<G: ChatApi + 'static>(
                 child_tracker = None;
                 child_state = None;
                 parent_done_pending = false;
+                parent_pump = ParentEventPump::default();
                 controls.stop_requested = false;
                 dirty = true;
             }
@@ -1937,6 +2201,7 @@ fn interactive<G: ChatApi + 'static>(
                 remote_publisher.clone(),
                 telemetry.clone(),
             ));
+            parent_pump = ParentEventPump::default();
             dirty = true;
         }
         if dirty || receiver.is_some() || recording.is_some() || voice_job.is_some() {
@@ -2143,6 +2408,7 @@ fn interactive<G: ChatApi + 'static>(
                             remote_publisher.clone(),
                             telemetry.clone(),
                         ));
+                        parent_pump = ParentEventPump::default();
                     }
                     KeyCode::Char(c) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
                         editor.insert(&c.to_string())
@@ -2313,8 +2579,10 @@ mod tests {
     }
 
     #[test]
-    fn bound_child_uses_owned_detail_then_child_chat_sse_and_terminal_lifecycle() {
-        struct ChildStreamApi;
+    fn bound_child_uses_actual_bare_lifecycle_dto_and_child_chat_sse() {
+        struct ChildStreamApi {
+            terminal: &'static str,
+        }
         const REMOTE: &str = "40000000-0000-4000-8000-000000000004";
         const PARENT_CHAT: &str = "10000000-0000-4000-8000-000000000001";
         const PARENT_OUTPUT: &str = "20000000-0000-4000-8000-000000000002";
@@ -2322,6 +2590,42 @@ mod tests {
         const CHILD: &str = "50000000-0000-4000-8000-000000000005";
         const CHILD_CHAT: &str = "70000000-0000-4000-8000-000000000007";
         const CHILD_OUTPUT: &str = "80000000-0000-4000-8000-000000000008";
+        fn lifecycle_frame(
+            seq: u64,
+            kind: &str,
+            message: Option<&str>,
+            result: Option<&str>,
+            error_code: Option<&str>,
+        ) -> String {
+            let event_id = format!("90000000-0000-4000-8000-{seq:012}");
+            let payload = json!({
+                "seq": seq,
+                "event_id": event_id,
+                "kind": kind,
+                "message": message,
+                "result": result,
+                "error_code": error_code,
+                "action_id": null,
+                "action_kind": null,
+                "payload_digest": null,
+                "display": null,
+                "approved": null,
+                "created_at": "2026-11-26T00:00:00Z"
+            });
+            format!("id: {seq}\nevent: {kind}\ndata: {payload}\n\n")
+        }
+
+        struct FragmentedReader {
+            cursor: Cursor<Vec<u8>>,
+            max_chunk: usize,
+        }
+        impl Read for FragmentedReader {
+            fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+                let length = target.len().min(self.max_chunk);
+                self.cursor.read(&mut target[..length])
+            }
+        }
+
         impl ChatApi for ChildStreamApi {
             fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
                 Err(ChatFailure::InvalidInput)
@@ -2345,10 +2649,19 @@ mod tests {
                 &self,
                 _: &str,
                 _: &str,
-                _: u64,
+                after: u64,
             ) -> Result<Box<dyn Read + Send>, ChatFailure> {
-                let sse = "id: 1\nevent: completed\ndata: {\"message\":\"Child complete\",\"data\":{\"seq\":1,\"kind\":\"completed\",\"result\":\"finished\"}}\n\n";
-                Ok(Box::new(Cursor::new(sse.as_bytes().to_vec())))
+                assert_eq!(after, 0);
+                let sse = [
+                    lifecycle_frame(1, "queued", None, None, None),
+                    lifecycle_frame(2, "progress", Some("processing ไทย"), None, None),
+                    lifecycle_frame(3, self.terminal, None, Some("finished"), Some("fixture")),
+                ]
+                .concat();
+                Ok(Box::new(FragmentedReader {
+                    cursor: Cursor::new(sse.into_bytes()),
+                    max_chunk: 3,
+                }))
             }
             fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
                 Ok(Vec::new())
@@ -2377,44 +2690,207 @@ mod tests {
             }
         }
 
+        for terminal in ["completed", "failed", "cancelled"] {
+            let mut tracker = begin_bound_child_tracker(
+                Arc::new(ChildStreamApi { terminal }),
+                REMOTE.into(),
+                CHILD.into(),
+                PARENT_CHAT.into(),
+                PARENT_OUTPUT.into(),
+                CALL.into(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut bound = false;
+            let mut tool_call = false;
+            let mut output_done = false;
+            let mut queued = false;
+            let mut progress = false;
+            let mut lifecycle_done = false;
+            while Instant::now() < deadline
+                && !(bound && tool_call && output_done && queued && progress && lifecycle_done)
+            {
+                match tracker.receiver.recv_timeout(Duration::from_millis(100)) {
+                    Ok(BoundChildMessage::Bound(chat, output)) => {
+                        assert_eq!(chat, CHILD_CHAT);
+                        assert_eq!(output, CHILD_OUTPUT);
+                        bound = true;
+                    }
+                    Ok(BoundChildMessage::Output(event)) if event.name == "tool_call" => {
+                        assert_eq!(event.data["call_id"], CALL);
+                        tool_call = true;
+                    }
+                    Ok(BoundChildMessage::Output(event)) if event.name == "done" => {
+                        output_done = true;
+                    }
+                    Ok(BoundChildMessage::Lifecycle(event)) if event.name == "queued" => {
+                        assert!(event.data["message"].is_null());
+                        queued = true;
+                    }
+                    Ok(BoundChildMessage::Lifecycle(event)) if event.name == "progress" => {
+                        assert_eq!(event.message, "processing ไทย");
+                        progress = true;
+                    }
+                    Ok(BoundChildMessage::Lifecycle(event)) if event.name == terminal => {
+                        assert_eq!(event.id, Some(3));
+                        assert_eq!(event.data["result"], "finished");
+                        tracker.terminal = observe_child_lifecycle(&mut tracker, &event);
+                        lifecycle_done = true;
+                    }
+                    Ok(BoundChildMessage::Error(error)) => {
+                        panic!("child tracker failed: {error}")
+                    }
+                    Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            assert!(bound && tool_call && output_done && queued && progress && lifecycle_done);
+            assert!(tracker.terminal);
+        }
+    }
+
+    #[test]
+    fn child_lifecycle_reconnects_after_transport_eof_and_confirms_cancel_terminal() {
+        struct RecoveryApi {
+            cancelled: Arc<AtomicBool>,
+            cursors: std::sync::Mutex<Vec<u64>>,
+        }
+        const REMOTE: &str = "40000000-0000-4000-8000-000000000004";
+        const PARENT_CHAT: &str = "10000000-0000-4000-8000-000000000001";
+        const PARENT_OUTPUT: &str = "20000000-0000-4000-8000-000000000002";
+        const CALL: &str = "30000000-0000-4000-8000-000000000003";
+        const CHILD: &str = "50000000-0000-4000-8000-000000000005";
+
+        impl ChatApi for RecoveryApi {
+            fn send(&self, _: Option<&str>, _: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn bound_child_detail(
+                &self,
+                _: &str,
+                child: &str,
+            ) -> Result<crate::domain::services::chat::BoundChildDetail, ChatFailure> {
+                Ok(crate::domain::services::chat::BoundChildDetail {
+                    child_id: child.into(),
+                    parent_chat_session_id: Some(PARENT_CHAT.into()),
+                    parent_output_id: Some(PARENT_OUTPUT.into()),
+                    parent_call_id: Some(CALL.into()),
+                    child_chat_session_id: None,
+                    child_output_id: None,
+                    status: if self.cancelled.load(Ordering::Acquire) {
+                        "cancelled"
+                    } else {
+                        "queued"
+                    }
+                    .into(),
+                })
+            }
+            fn bound_child_events(
+                &self,
+                _: &str,
+                _: &str,
+                after: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                self.cursors.lock().unwrap().push(after);
+                let frames = if after == 0 {
+                    let payload = json!({
+                        "seq":1,
+                        "event_id":"90000000-0000-4000-8000-000000000001",
+                        "kind":"queued",
+                        "message":null,
+                        "result":null,
+                        "error_code":null,
+                        "action_id":null,
+                        "action_kind":null,
+                        "payload_digest":null,
+                        "display":null,
+                        "approved":null,
+                        "created_at":"2026-11-26T00:00:00Z"
+                    });
+                    format!("id: 1\nevent: queued\ndata: {payload}\n\n")
+                } else if self.cancelled.load(Ordering::Acquire) {
+                    let payload = json!({
+                        "seq":2,
+                        "event_id":"90000000-0000-4000-8000-000000000002",
+                        "kind":"cancelled",
+                        "message":null,
+                        "result":null,
+                        "error_code":null,
+                        "action_id":null,
+                        "action_kind":null,
+                        "payload_digest":null,
+                        "display":null,
+                        "approved":null,
+                        "created_at":"2026-11-26T00:00:00Z"
+                    });
+                    format!("id: 2\nevent: cancelled\ndata: {payload}\n\n")
+                } else {
+                    String::new()
+                };
+                Ok(Box::new(Cursor::new(frames.into_bytes())))
+            }
+            fn chats(&self) -> Result<Vec<ChatSummary>, ChatFailure> {
+                Ok(Vec::new())
+            }
+            fn history(
+                &self,
+                _: &str,
+            ) -> Result<crate::domain::models::chat::ChatPage, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn reconnect(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+            ) -> Result<Box<dyn Read + Send>, ChatFailure> {
+                Err(ChatFailure::InvalidInput)
+            }
+            fn cancel(&self, _: &str, _: &str) -> Result<(), ChatFailure> {
+                self.cancelled.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+
+        let api = Arc::new(RecoveryApi {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cursors: std::sync::Mutex::new(Vec::new()),
+        });
         let mut tracker = begin_bound_child_tracker(
-            Arc::new(ChildStreamApi),
+            api.clone(),
             REMOTE.into(),
             CHILD.into(),
             PARENT_CHAT.into(),
             PARENT_OUTPUT.into(),
             CALL.into(),
         );
+        assert!(matches!(
+            tracker.receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(BoundChildMessage::Lifecycle(StreamEvent { ref name, .. })) if name == "queued"
+        ));
+
+        // The parent cancellation is requested while child lifecycle is still nonterminal.
+        api.cancel(PARENT_CHAT, PARENT_OUTPUT).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut bound = false;
-        let mut tool_call = false;
-        let mut output_done = false;
-        let mut lifecycle_done = false;
-        while Instant::now() < deadline && !(bound && tool_call && output_done && lifecycle_done) {
+        let mut terminal = false;
+        while Instant::now() < deadline && !terminal {
             match tracker.receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(BoundChildMessage::Bound(chat, output)) => {
-                    assert_eq!(chat, CHILD_CHAT);
-                    assert_eq!(output, CHILD_OUTPUT);
-                    bound = true;
+                Ok(BoundChildMessage::Lifecycle(event)) if event.name == "cancelled" => {
+                    tracker.terminal = observe_child_lifecycle(&mut tracker, &event);
+                    terminal = true;
                 }
-                Ok(BoundChildMessage::Output(event)) if event.name == "tool_call" => {
-                    assert_eq!(event.data["call_id"], CALL);
-                    tool_call = true;
-                }
-                Ok(BoundChildMessage::Output(event)) if event.name == "done" => {
-                    output_done = true;
-                }
-                Ok(BoundChildMessage::Lifecycle(event)) if event.name == "completed" => {
+                Ok(BoundChildMessage::ConfirmedTerminal(status)) if status == "cancelled" => {
                     tracker.terminal = true;
-                    lifecycle_done = true;
+                    terminal = true;
                 }
                 Ok(BoundChildMessage::Error(error)) => panic!("child tracker failed: {error}"),
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        assert!(bound && tool_call && output_done && lifecycle_done);
-        assert!(tracker.terminal);
+        assert!(terminal && tracker.terminal);
+        let cursors = api.cursors.lock().unwrap();
+        assert_eq!(cursors.first(), Some(&0));
+        assert!(cursors.contains(&1));
     }
 
     #[test]
@@ -2481,6 +2957,117 @@ mod tests {
             tracker.terminal = false;
         }
         assert!(parent_can_finish(true, None));
+    }
+
+    #[test]
+    fn parent_event_pump_keeps_done_turn_active_after_sender_drop_until_child_terminal() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(StreamEvent {
+                id: Some(1),
+                name: "done".into(),
+                message: "complete".into(),
+                data: json!({
+                    "session_id":"10000000-0000-4000-8000-000000000001",
+                    "output_id":"20000000-0000-4000-8000-000000000002",
+                    "total_ms":12
+                }),
+            }))
+            .unwrap();
+        drop(sender);
+
+        let mut parent_state = ChatState::default();
+        let mut child_terminal = false;
+        let (_child_sender, child_receiver) = mpsc::channel();
+        let mut child_tracker = BoundChildTracker {
+            receiver: child_receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            terminal: false,
+        };
+        let mut parent_pump = ParentEventPump::default();
+        let parent_done_pending = match parent_pump.poll(&receiver, !child_terminal) {
+            ParentEventPoll::Event(Ok(event)) => {
+                assert!(parent_state.apply(&event).unwrap());
+                parent_state.complete
+            }
+            other => panic!("expected parent done event, got {}", poll_name(&other)),
+        };
+        assert!(parent_done_pending);
+        assert!(parent_state.complete);
+
+        assert!(matches!(
+            parent_pump.poll(&receiver, !child_terminal),
+            ParentEventPoll::WaitingForChild
+        ));
+        assert!(!parent_can_finish(
+            parent_done_pending,
+            Some(&child_tracker)
+        ));
+
+        child_terminal = true;
+        child_tracker.terminal = child_terminal;
+        assert!(matches!(
+            parent_pump.poll(&receiver, !child_terminal),
+            ParentEventPoll::Disconnected
+        ));
+        assert!(parent_can_finish(parent_done_pending, Some(&child_tracker)));
+    }
+
+    #[test]
+    fn child_lifecycle_decoder_rejects_cursor_kind_and_dto_mismatches() {
+        let payload = json!({
+            "seq": 2,
+            "event_id": "90000000-0000-4000-8000-000000000002",
+            "kind": "progress",
+            "message": null,
+            "result": null,
+            "error_code": null,
+            "action_id": null,
+            "action_kind": null,
+            "payload_digest": null,
+            "display": null,
+            "approved": null,
+            "created_at": "2026-11-26T00:00:00Z"
+        });
+        let frame = || crate::dal::remote::sse::SseFrame {
+            id: Some(2),
+            name: "progress".into(),
+            data: serde_json::to_vec(&payload).unwrap(),
+        };
+        assert!(decode_child_lifecycle_frame(frame(), 1).is_ok());
+        assert!(matches!(
+            decode_child_lifecycle_frame(frame(), 2),
+            Err(ChatFailure::InvalidResponse)
+        ));
+        let mut wrong_cursor = frame();
+        wrong_cursor.id = Some(3);
+        assert!(matches!(
+            decode_child_lifecycle_frame(wrong_cursor, 1),
+            Err(ChatFailure::InvalidResponse)
+        ));
+        let mut wrong_kind = frame();
+        wrong_kind.name = "queued".into();
+        assert!(matches!(
+            decode_child_lifecycle_frame(wrong_kind, 1),
+            Err(ChatFailure::InvalidResponse)
+        ));
+        let mut missing_nullable_field = frame();
+        let mut missing: Value = serde_json::from_slice(&missing_nullable_field.data).unwrap();
+        missing.as_object_mut().unwrap().remove("message");
+        missing_nullable_field.data = serde_json::to_vec(&missing).unwrap();
+        assert!(matches!(
+            decode_child_lifecycle_frame(missing_nullable_field, 1),
+            Err(ChatFailure::InvalidResponse)
+        ));
+    }
+
+    fn poll_name(poll: &ParentEventPoll) -> &'static str {
+        match poll {
+            ParentEventPoll::Event(_) => "event",
+            ParentEventPoll::Empty => "empty",
+            ParentEventPoll::WaitingForChild => "waiting_for_child",
+            ParentEventPoll::Disconnected => "disconnected",
+        }
     }
 
     struct AckWaitReader {
