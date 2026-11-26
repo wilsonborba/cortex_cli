@@ -377,6 +377,38 @@ fn image_content_type(bytes: &[u8]) -> Option<&'static str> {
 }
 
 impl ChatApi for CortexClient {
+    fn upload_temporary_text(&self, name: &str, text: &str) -> Result<String, ChatFailure> {
+        if name.is_empty() || name.len() > 128 || text.is_empty() || text.len() > 512 * 1024 {
+            return Err(ChatFailure::InvalidInput);
+        }
+        let part = multipart::Part::text(text.to_owned())
+            .file_name(name.to_owned())
+            .mime_str("text/plain; charset=utf-8")
+            .map_err(|_| ChatFailure::InvalidInput)?;
+        let form = multipart::Form::new()
+            .text("app_id", "cortex")
+            .text("temporary", "true")
+            .part("file", part);
+        let response = self
+            .authenticated(
+                self.client
+                    .post(format!("{}/files", self.base))
+                    .multipart(form),
+                true,
+            )
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let response = Self::checked(response)?;
+        if response.status().as_u16() != 201 {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        let value = Self::json(response)?;
+        value["data"]["file_id"]
+            .as_str()
+            .filter(|id| valid_id(id))
+            .map(str::to_owned)
+            .ok_or(ChatFailure::InvalidResponse)
+    }
     fn send(&self, chat: Option<&str>, text: &str) -> Result<Box<dyn Read + Send>, ChatFailure> {
         self.send_with_files(chat, text, &[])
     }

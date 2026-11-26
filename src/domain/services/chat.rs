@@ -22,6 +22,9 @@ pub struct BoundChildDetail {
 }
 
 pub trait ChatApi: Send + Sync {
+    fn upload_temporary_text(&self, _name: &str, _text: &str) -> Result<String, ChatFailure> {
+        Err(ChatFailure::SourceUnavailable)
+    }
     fn send(&self, chat: Option<&str>, text: &str) -> Result<Box<dyn Read + Send>, ChatFailure>;
     fn send_with_files(
         &self,

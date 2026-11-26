@@ -11,6 +11,9 @@
 - Record verified CLI release preparation
 - Record partial write outcome fix
 - Record reviewed local voice input (#10)
+- Record reviewed subagent workflow
+- Update selected-note omissions changelog
+- Record reviewed selected note context (#7)
 
 
 ### Features
@@ -33,6 +36,8 @@
 - Add local hold-to-talk input (#10)
 - Integrate reviewed local speech input (#10)
 - Integrate reviewed bound child execution and approvals (#5)
+- Add explicit Annotations note selection
+- Attach selected notes as temporary context
 
 
 ### Fixes
@@ -55,6 +60,9 @@
 - Keep child tracked through parent stream errors
 - Retain child until terminal confirmation
 - Retain child confirmation through common cleanup (#5)
+- Bind turn events to confirmed child turns
+- Disclose omitted selected-note blocks
+- Emit terminal when turn stream never starts
 
 
 ### Maintenance
@@ -62,6 +70,7 @@
 - Bootstrap Cortex CLI layers and native build checks
 - Merge Cortex CLI bootstrap
 - Refresh sign-in formatting and changelog
+- Update selected notes changelog
 
 
 ### Tests
@@ -78,6 +87,7 @@
 ### merge
 - Refresh accepted base for approval tools
 - Refresh voice input from accepted feature base
+- Refresh selected notes from accepted feature base
 
 
 ### refactor
