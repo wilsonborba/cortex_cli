@@ -323,16 +323,54 @@ impl RemotePublisher {
         }
     }
 
-    fn flush(&self) {
+    fn flush(&self) -> bool {
         let (sender, receiver) = mpsc::sync_channel(1);
-        if self.sender.send(PublishMessage::Flush(sender)).is_ok() {
-            let _ = receiver.recv_timeout(Duration::from_secs(5));
-        }
+        self.sender.send(PublishMessage::Flush(sender)).is_ok()
+            && receiver.recv_timeout(Duration::from_secs(5)).is_ok()
     }
 
     fn stop(&self) {
         let _ = self.sender.try_send(PublishMessage::Stop);
     }
+}
+
+fn publish_selected_image(
+    api: &CortexClient,
+    publisher: &RemotePublisher,
+    remote_session: &str,
+    turn_id: &str,
+    path: &std::path::Path,
+) -> Result<(), ChatFailure> {
+    let image = api.upload_temporary_image(path)?;
+    if !publisher.flush() || publisher.failed.load(Ordering::Relaxed) {
+        return Err(ChatFailure::Connection);
+    }
+    let event = api.post_remote_event(
+        remote_session,
+        RemoteEventKind::Artifact,
+        json!({
+            "turn_id": turn_id,
+            "file_id": &image.file_id,
+            "name": &image.name,
+            "content_type": image.content_type,
+        }),
+        None,
+    )?;
+    if event.kind != RemoteEventKind::Artifact
+        || event.payload["file_id"] != image.file_id
+        || event.payload["turn_id"] != turn_id
+    {
+        return Err(ChatFailure::InvalidResponse);
+    }
+    Ok(())
+}
+
+fn selected_artifact_path(text: &str) -> Option<&str> {
+    let suffix = text.strip_prefix("/artifact")?;
+    if suffix.is_empty() {
+        return Some("");
+    }
+    suffix.strip_prefix(' ').map(str::trim)
 }
 
 struct RemoteSessionGuard {
@@ -570,7 +608,19 @@ impl RemoteSessionGuard {
             "Remote control is active for session {}.",
             guard.session_id
         )?;
+        writeln!(
+            out,
+            "After a turn completes, type /artifact <image path> to share one selected image with your phone."
+        )?;
         Ok(guard)
+    }
+
+    fn share_selected_image(
+        &self,
+        path: &std::path::Path,
+        turn_id: &str,
+    ) -> Result<(), ChatFailure> {
+        publish_selected_image(&self.api, &self.publisher, &self.session_id, turn_id, path)
     }
 }
 
@@ -2444,7 +2494,7 @@ fn interactive<G: ChatApi + 'static>(
                     KeyCode::Char('d' | 'D') if control && editor.text.is_empty() => {
                         surface.clear(out)?;
                         if let Some(remote) = remote.as_ref() {
-                            remote.publisher.flush();
+                            let _ = remote.publisher.flush();
                         }
                         return surface.text(out, "\n");
                     }
@@ -2453,6 +2503,33 @@ fn interactive<G: ChatApi + 'static>(
                             continue;
                         }
                         let text = editor.take();
+                        if let (Some(remote), Some(path)) =
+                            (remote.as_ref(), selected_artifact_path(&text))
+                        {
+                            if path.is_empty() {
+                                surface.text(
+                                    out,
+                                    "\nUse /artifact <image path> after a completed turn.\n",
+                                )?;
+                                continue;
+                            }
+                            let Some(turn_id) =
+                                state.output_id.as_deref().filter(|_| state.complete)
+                            else {
+                                surface
+                                    .text(out, "\nShare an image after a turn has completed.\n")?;
+                                continue;
+                            };
+                            surface
+                                .text(out, "\nSharing the selected image with your phone...\n")?;
+                            match remote.share_selected_image(std::path::Path::new(path), turn_id) {
+                                Ok(()) => {
+                                    surface.text(out, "Image artifact sent to your phone.\n")?
+                                }
+                                Err(error) => surface.text(out, &format!("{error}\n"))?,
+                            }
+                            continue;
+                        }
                         surface.text(out, &format!("\n> {}\n", clean(&text)))?;
                         state = ChatState {
                             chat_id: chat.clone(),
@@ -4218,6 +4295,171 @@ mod tests {
         assert_eq!(result, Err(VoiceFailure::Cancelled));
         assert!(stopped.load(Ordering::SeqCst));
         job.join_completed();
+    }
+
+    #[test]
+    fn artifact_command_requires_an_explicit_path() {
+        assert_eq!(selected_artifact_path("/artifact"), Some(""));
+        assert_eq!(
+            selected_artifact_path("/artifact reports/final image.png"),
+            Some("reports/final image.png")
+        );
+        assert_eq!(selected_artifact_path("/artifactx image.png"), None);
+        assert_eq!(selected_artifact_path("ordinary prompt"), None);
+    }
+
+    #[test]
+    fn selected_image_is_uploaded_temporarily_then_sent_as_a_bound_artifact_event() {
+        use std::net::{TcpListener, TcpStream};
+
+        const REMOTE: &str = "40000000-0000-4000-8000-000000000004";
+        const TURN: &str = "20000000-0000-4000-8000-000000000002";
+        const FILE: &str = "50000000-0000-4000-8000-000000000005";
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\nfixture-image-bytes";
+
+        fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0, "client closed before request headers");
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break position;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .expect("bounded content length");
+            let body_start = header_end + 4;
+            while bytes.len() < body_start + length {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0, "client closed before the complete request body");
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            (headers, bytes[body_start..body_start + length].to_vec())
+        }
+
+        fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut upload_stream, _) = listener.accept().unwrap();
+            let (upload_headers, upload_body) = read_request(&mut upload_stream);
+            assert!(upload_headers.starts_with("POST /apps/cortex/v1/files HTTP/1.1"));
+            assert!(
+                upload_headers
+                    .to_lowercase()
+                    .contains("x-csrf-token: fixture-csrf")
+            );
+            let content_type = upload_headers
+                .lines()
+                .find(|line| {
+                    line.to_lowercase()
+                        .starts_with("content-type: multipart/form-data;")
+                })
+                .expect("multipart upload");
+            let boundary = content_type.split("boundary=").nth(1).unwrap();
+            let upload_text = String::from_utf8_lossy(&upload_body);
+            assert!(upload_text.contains("name=\"app_id\""));
+            assert!(upload_text.contains("\r\ncortex\r\n"));
+            assert!(upload_text.contains("name=\"temporary\""));
+            assert!(upload_text.contains("\r\ntrue\r\n"));
+            assert!(upload_text.contains("filename=\"diagram.png\""));
+            assert!(upload_text.contains("Content-Type: image/png"));
+            assert!(upload_text.contains(boundary));
+            assert!(upload_body.windows(PNG.len()).any(|window| window == PNG));
+            respond(
+                &mut upload_stream,
+                "201 Created",
+                &format!("{{\"message\":\"File saved\",\"data\":{{\"file_id\":\"{FILE}\"}}}}"),
+            );
+
+            let (mut event_stream, _) = listener.accept().unwrap();
+            let (event_headers, event_body) = read_request(&mut event_stream);
+            assert!(event_headers.starts_with(&format!(
+                "POST /apps/cortex/v1/remote/sessions/{REMOTE}/events HTTP/1.1"
+            )));
+            let event_body: Value = serde_json::from_slice(&event_body).unwrap();
+            assert_eq!(event_body["kind"], "artifact");
+            assert_eq!(event_body["ack_command_id"], Value::Null);
+            assert_eq!(
+                event_body["payload"],
+                json!({
+                    "turn_id":TURN,
+                    "file_id":FILE,
+                    "name":"diagram.png",
+                    "content_type":"image/png"
+                })
+            );
+            respond(
+                &mut event_stream,
+                "201 Created",
+                &format!(
+                    "{{\"data\":{{\"id\":17,\"kind\":\"artifact\",\"payload\":{{\"turn_id\":\"{TURN}\",\"file_id\":\"{FILE}\",\"name\":\"diagram.png\",\"content_type\":\"image/png\"}},\"created_at_ms\":123}}}}"
+                ),
+            );
+            (upload_headers, event_headers)
+        });
+
+        let image_path = std::env::current_dir()
+            .unwrap()
+            .join("target/test-fixtures/cli9/diagram.png");
+        std::fs::create_dir_all(image_path.parent().unwrap()).unwrap();
+        std::fs::write(&image_path, PNG).unwrap();
+        let api = CortexClient::test_with_base(
+            &format!("http://{address}/apps/cortex/v1"),
+            Arc::new(Session {
+                session_id: "fixture-session".into(),
+                csrf_token: "fixture-csrf".into(),
+            }),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let publisher_worker = thread::spawn(move || {
+            while let Ok(message) = receiver.recv() {
+                match message {
+                    PublishMessage::Flush(reply) => {
+                        let _ = reply.send(());
+                    }
+                    PublishMessage::Stop => break,
+                    PublishMessage::Event(_, _) => panic!("test sends no queued events"),
+                }
+            }
+        });
+        let publisher = RemotePublisher {
+            sender,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        publish_selected_image(&api, &publisher, REMOTE, TURN, &image_path).unwrap();
+        publisher.stop();
+        publisher_worker.join().unwrap();
+        let (upload_headers, event_headers) = server.join().unwrap();
+        assert!(
+            upload_headers
+                .to_lowercase()
+                .contains("cookie: sid=fixture-session; csrf=fixture-csrf")
+        );
+        assert!(
+            event_headers
+                .to_lowercase()
+                .contains("x-csrf-token: fixture-csrf")
+        );
+        std::fs::remove_file(&image_path).unwrap();
     }
 
     #[test]

@@ -1,11 +1,17 @@
 //! Authenticated Cortex routes through the gateway. No backend identity headers.
 
 use reqwest::{
-    blocking::{Client, RequestBuilder, Response},
+    blocking::{Client, RequestBuilder, Response, multipart},
     redirect::Policy,
 };
 use serde_json::{Value, json};
-use std::{io::Read, sync::Arc, time::Duration};
+use std::{
+    fs::File,
+    io::{Read, Take},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::domain::{
     models::{
@@ -16,6 +22,14 @@ use crate::domain::{
     },
     services::chat::ChatApi,
 };
+
+const MAX_REMOTE_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+
+pub struct UploadedImage {
+    pub file_id: String,
+    pub name: String,
+    pub content_type: &'static str,
+}
 
 #[derive(Clone)]
 pub struct CortexClient {
@@ -51,6 +65,11 @@ impl CortexClient {
             base: base.trim_end_matches('/').to_owned(),
             session,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_base(base: &str, session: Arc<Session>) -> Result<Self, ChatFailure> {
+        Self::with_base(base, session)
     }
 
     fn authenticated(&self, request: RequestBuilder, mutation: bool) -> RequestBuilder {
@@ -111,6 +130,68 @@ impl CortexClient {
     fn output_action(response: Response) -> Result<OutputActionReceipt, ChatFailure> {
         let value = Self::json(Self::checked(response)?)?;
         serde_json::from_value(value["data"].clone()).map_err(|_| ChatFailure::InvalidResponse)
+    }
+
+    pub fn upload_temporary_image(&self, path: &Path) -> Result<UploadedImage, ChatFailure> {
+        let metadata = std::fs::metadata(path).map_err(|_| ChatFailure::InvalidArtifact)?;
+        if !metadata.is_file() || metadata.len() > MAX_REMOTE_IMAGE_BYTES {
+            return Err(ChatFailure::InvalidArtifact);
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| {
+                !name.is_empty()
+                    && name.len() <= 255
+                    && !name
+                        .chars()
+                        .any(|character| character.is_control() || ['"', '\\'].contains(&character))
+            })
+            .ok_or(ChatFailure::InvalidArtifact)?
+            .to_owned();
+        let file = File::open(path).map_err(|_| ChatFailure::InvalidArtifact)?;
+        let mut bytes = Vec::with_capacity(metadata.len().min(MAX_REMOTE_IMAGE_BYTES) as usize);
+        let mut bounded: Take<File> = file.take(MAX_REMOTE_IMAGE_BYTES + 1);
+        bounded
+            .read_to_end(&mut bytes)
+            .map_err(|_| ChatFailure::InvalidArtifact)?;
+        if bytes.len() as u64 > MAX_REMOTE_IMAGE_BYTES {
+            return Err(ChatFailure::InvalidArtifact);
+        }
+        let content_type = image_content_type(&bytes).ok_or(ChatFailure::InvalidArtifact)?;
+        let part = multipart::Part::bytes(bytes)
+            .file_name(name.clone())
+            .mime_str(content_type)
+            .map_err(|_| ChatFailure::InvalidArtifact)?;
+        let form = multipart::Form::new()
+            .text("app_id", "cortex")
+            .text("temporary", "true")
+            .part("file", part);
+        let response = self
+            .authenticated(
+                self.client
+                    .post(format!("{}/files", self.base))
+                    .timeout(Duration::from_secs(60))
+                    .multipart(form),
+                true,
+            )
+            .send()
+            .map_err(|_| ChatFailure::Connection)?;
+        let response = Self::checked(response)?;
+        if response.status().as_u16() != 201 {
+            return Err(ChatFailure::InvalidResponse);
+        }
+        let value = Self::json(response)?;
+        let file_id = value["data"]["file_id"]
+            .as_str()
+            .filter(|id| valid_id(id))
+            .map(str::to_owned)
+            .ok_or(ChatFailure::InvalidResponse)?;
+        Ok(UploadedImage {
+            file_id,
+            name,
+            content_type,
+        })
     }
 
     pub fn register_remote_session(&self) -> Result<RemoteSession, ChatFailure> {
@@ -278,6 +359,20 @@ impl CortexClient {
             return Err(ChatFailure::InvalidResponse);
         }
         Ok(Box::new(response))
+    }
+}
+
+fn image_content_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 
@@ -1076,5 +1171,26 @@ mod tests {
         assert_eq!(body["text"], "look at this");
         assert_eq!(body["stream"], true);
         assert_eq!(body.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn remote_artifact_mime_is_derived_only_from_supported_image_signatures() {
+        assert_eq!(
+            super::image_content_type(b"\x89PNG\r\n\x1a\nfixture"),
+            Some("image/png")
+        );
+        assert_eq!(
+            super::image_content_type(b"\xff\xd8\xfffixture"),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            super::image_content_type(b"GIF89afixture"),
+            Some("image/gif")
+        );
+        assert_eq!(
+            super::image_content_type(b"RIFF\x04\x00\x00\x00WEBPfixture"),
+            Some("image/webp")
+        );
+        assert_eq!(super::image_content_type(b"plain text"), None);
     }
 }

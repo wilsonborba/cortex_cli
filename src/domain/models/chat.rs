@@ -13,6 +13,7 @@ pub enum ChatFailure {
     Rejected(Option<u16>),
     InvalidInput,
     RunningOutput,
+    InvalidArtifact,
 }
 
 impl fmt::Display for ChatFailure {
@@ -33,6 +34,9 @@ impl fmt::Display for ChatFailure {
             Self::InvalidInput => f.write_str("Enter a prompt or a valid conversation identifier."),
             Self::RunningOutput => f.write_str(
                 "This conversation has a running output. Resume without a new prompt, or wait for it to finish.",
+            ),
+            Self::InvalidArtifact => f.write_str(
+                "Choose a readable PNG, JPEG, GIF, or WebP image smaller than 25 MiB.",
             ),
         }
     }

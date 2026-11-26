@@ -99,6 +99,9 @@ impl Telemetry {
                 crate::domain::models::chat::ChatFailure::RunningOutput => {
                     ("running_output", "Chat already had a running output.")
                 }
+                crate::domain::models::chat::ChatFailure::InvalidArtifact => {
+                    ("invalid_artifact", "Selected image artifact was invalid.")
+                }
             };
             self.api.post_error(
                 &self.session,

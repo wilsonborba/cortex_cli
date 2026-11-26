@@ -130,10 +130,13 @@ work without mouse capture or an alternate screen.
 `--remote-control` keeps the interactive CLI connected to the Cortex phone
 session while it runs. Prompts sent from the phone enter the same chat, and
 existing file IDs attached by the phone are passed through as references; the
-CLI does not upload local files. Progress and answer text are sent back to the
-phone. The CLI must remain open and signed in for remote control to work. A
-phone cancellation requests the same server cancellation as Ctrl+C. Phone
-approval responses are acknowledged in the terminal.
+CLI does not upload local files automatically. After a turn completes, enter
+`/artifact <image path>` to explicitly share one PNG, JPEG, GIF, or WebP image
+with the phone for that turn. The image is uploaded to Cortex's existing
+temporary file store and follows its normal expiry. Progress and answer text
+are sent back to the phone. The CLI must remain open and signed in for remote
+control to work. A phone cancellation requests the same server cancellation as
+Ctrl+C. Phone approval responses are acknowledged in the terminal.
 
 Print mode writes answer text to stdout. Login prompts use stderr when needed.
 It does not add terminal colours to the answer. Set `NO_COLOR` to disable colour
