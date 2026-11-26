@@ -24,6 +24,7 @@
 
 
 ### Fixes
+- Report partial file action writes accurately
 - Reject non-executable release entries and clean failed installer/package staging
 - Discard invalid successful handoffs before session storage
 - Keep narrow terminal activity details readable
