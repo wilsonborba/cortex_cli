@@ -11,8 +11,12 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::domain::{
-    models::native_auth::{AuthFailure, FinishedLogin, Handoff, Session},
+    models::{
+        native_auth::{AuthFailure, FinishedLogin, Handoff, Session},
+        telemetry::{LegalStatus, TrackingBatch, TrackingError},
+    },
     services::auth::Gateway,
+    services::telemetry::{LegalTelemetryApi, TelemetryError, TrackingApi},
 };
 
 pub struct GatewayClient {
@@ -71,6 +75,81 @@ impl GatewayClient {
             .send()
             .map_err(|_| AuthFailure::Transport)?;
         decode(response)
+    }
+
+    fn authenticated_json<T: Serialize>(
+        &self,
+        session: &Session,
+        path: &str,
+        body: Option<&T>,
+    ) -> Result<Value, AuthFailure> {
+        if !session.is_valid() {
+            return Err(AuthFailure::Invalid);
+        }
+        let url = format!("{}{path}", self.base);
+        let mut request = if body.is_some() {
+            self.client.post(url)
+        } else {
+            self.client.get(url)
+        }
+        .header(
+            "Cookie",
+            format!("sid={}; csrf={}", session.session_id, session.csrf_token),
+        );
+        if let Some(body) = body {
+            request = request
+                .header("X-CSRF-Token", &session.csrf_token)
+                .json(body);
+        }
+        let response = request.send().map_err(|_| AuthFailure::Transport)?;
+        decode(response)
+    }
+
+    pub fn post_tracking_batch(
+        &self,
+        session: &Session,
+        batch: &TrackingBatch,
+    ) -> Result<(), AuthFailure> {
+        self.authenticated_json(session, "/apps/api/v1/telemetry/events", Some(batch))
+            .map(|_| ())
+    }
+
+    pub fn post_tracking_error(
+        &self,
+        session: &Session,
+        error: &TrackingError,
+    ) -> Result<(), AuthFailure> {
+        self.authenticated_json(session, "/apps/api/v1/telemetry/errors", Some(error))
+            .map(|_| ())
+    }
+}
+
+impl LegalTelemetryApi for GatewayClient {
+    fn legal_status(&self, session: &Session) -> Result<LegalStatus, TelemetryError> {
+        let value = self
+            .authenticated_json::<Value>(session, "/apps/domain/v1/legal/status", None)
+            .map_err(|_| TelemetryError)?;
+        let status: LegalStatus =
+            serde_json::from_value(value["data"].clone()).map_err(|_| TelemetryError)?;
+        if status.privacy_policy.current_version.is_empty()
+            || status.privacy_policy.current_version.len() > 40
+            || (status.privacy_policy.accepted
+                && status.privacy_policy.version.as_deref()
+                    != Some(status.privacy_policy.current_version.as_str()))
+        {
+            return Err(TelemetryError);
+        }
+        Ok(status)
+    }
+}
+
+impl TrackingApi for GatewayClient {
+    fn post_batch(&self, session: &Session, batch: &TrackingBatch) {
+        let _ = self.post_tracking_batch(session, batch);
+    }
+
+    fn post_error(&self, session: &Session, error: &TrackingError) {
+        let _ = self.post_tracking_error(session, error);
     }
 }
 
@@ -299,6 +378,56 @@ mod tests {
         assert!(request.contains("cookie: sid=fixture-session; csrf=fixture-csrf\r\n"));
         assert!(request.contains("x-csrf-token: fixture-csrf\r\n"));
         assert!(!request.contains("all_devices"));
+    }
+
+    #[test]
+    fn telemetry_uses_the_existing_legal_status_and_tracking_contracts() {
+        let session = Session {
+            session_id: "fixture-session".into(),
+            csrf_token: "fixture-csrf".into(),
+        };
+        let (client, worker) = server(
+            200,
+            json!({"data":{"privacy_policy":{"accepted":true,"version":"2026-09-14","current_version":"2026-09-14"}}}),
+        );
+        let status = client.legal_status(&session).unwrap();
+        assert!(status.privacy_policy.accepted_current_version());
+        let request = worker.join().unwrap().to_lowercase();
+        assert!(request.starts_with("get /apps/domain/v1/legal/status http/1.1\r\n"));
+        assert!(request.contains("cookie: sid=fixture-session; csrf=fixture-csrf\r\n"));
+
+        let (client, worker) = server(200, json!({"data":null}));
+        client
+            .post_tracking_batch(
+                &session,
+                &TrackingBatch {
+                    app_id: "cortex",
+                    session_id: "00000000-0000-4000-8000-000000000001".into(),
+                    events: vec![crate::domain::models::telemetry::TrackingEvent {
+                        seq: 0,
+                        event_type: "submit",
+                        screen: "terminal_chat",
+                        route: "/chat",
+                        path: "/chat",
+                        element_id: "chat.request.completed",
+                        element_label: "Chat request completed",
+                        element_path: "terminal > chat > request",
+                        value: None,
+                        sensitive: false,
+                    }],
+                },
+            )
+            .unwrap();
+        let request = worker.join().unwrap().to_lowercase();
+        assert!(request.starts_with("post /apps/api/v1/telemetry/events http/1.1\r\n"));
+        assert!(request.contains("x-csrf-token: fixture-csrf\r\n"));
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let payload: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["app_id"], "cortex");
+        assert_eq!(payload["events"][0]["element_id"], "chat.request.completed");
+        assert!(payload["events"][0]["value"].is_null());
+        assert!(!body.contains("prompt"));
+        assert!(!body.contains("response text"));
     }
 
     #[test]
