@@ -27,6 +27,7 @@
 - Keep narrow terminal activity details readable
 - Correlate streamed results with the selected conversation
 - Keep terminal title readable on light backgrounds
+- Disclose omitted selected-note blocks
 
 
 ### Maintenance
