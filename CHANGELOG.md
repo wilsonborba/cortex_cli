@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Documentation
+- Document public installer availability, target architectures and verification scope
 - Document owner Mac verification without hosted CI
 - Clarify public macOS build instructions
 - Merge bootstrap review corrections
@@ -40,6 +41,7 @@
 
 
 ### Fixes
+- Normalize owner metadata in native CLI archives
 - Discard invalid successful handoffs before session storage
 - Keep narrow terminal activity details readable
 - Correlate streamed results with the selected conversation
