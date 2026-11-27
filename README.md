@@ -24,6 +24,10 @@ curl -fsSL https://cortex.asodya.com/install.sh | bash
 This installs to `~/.local/bin/cortex` by default and does not edit shell
 configuration. The command works only after an owner-authorized stable release
 and its checksum manifest are published.
+The CLI package targets x86_64 and aarch64 Linux, plus Intel and Apple silicon
+macOS; each archive must be built on its matching native platform. Android and
+iOS are not CLI package targets. The installer verifies SHA-256 checksums and
+does not claim or verify a release signature.
 
 Cargo installs `cortex` into its bin directory. Add that directory to your `PATH`.
 No account or provider credential is needed for these commands. A versioned
