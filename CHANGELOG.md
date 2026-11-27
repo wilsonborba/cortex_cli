@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Documentation
+- Document the public stable-release installer command and availability gate
 - Document owner Mac verification without hosted CI
 - Clarify public macOS build instructions
 - Merge bootstrap review corrections

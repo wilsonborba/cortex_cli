@@ -14,6 +14,17 @@ cortex --help
 cortex --version
 ```
 
+Install the latest published stable Linux or macOS release with the public
+installer command:
+
+```sh
+curl -fsSL https://cortex.asodya.com/install.sh | bash
+```
+
+This installs to `~/.local/bin/cortex` by default and does not edit shell
+configuration. The command works only after an owner-authorized stable release
+and its checksum manifest are published.
+
 Cargo installs `cortex` into its bin directory. Add that directory to your `PATH`.
 No account or provider credential is needed for these commands. A versioned
 release installer is prepared in `scripts/install.sh`; it downloads only the
